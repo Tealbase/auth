@@ -6,7 +6,7 @@ import (
 	"net/url"
 	"strconv"
 
-	"github.com/tealbase/gotrue/internal/models"
+	"github.com/tealbase/auth/internal/models"
 )
 
 const defaultPerPage = 50

@@ -11,8 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/models"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/models"
 )
 
 type AuditTestSuite struct {
@@ -46,9 +46,16 @@ func (ts *AuditTestSuite) makeSuperAdmin(email string) string {
 	require.NoError(ts.T(), err, "Error making new user")
 
 	u.Role = "tealbase_admin"
+	require.NoError(ts.T(), ts.API.db.Create(u))
+
+	session, err := models.NewSession(u.ID, nil)
+	require.NoError(ts.T(), err)
+	require.NoError(ts.T(), ts.API.db.Create(session))
 
 	var token string
-	token, _, err = generateAccessToken(ts.API.db, u, nil, &ts.Config.JWT)
+
+	req := httptest.NewRequest(http.MethodPost, "/token?grant_type=password", nil)
+	token, _, err = ts.API.generateAccessToken(req, ts.API.db, u, &session.ID, models.PasswordGrant)
 	require.NoError(ts.T(), err, "Error generating access token")
 
 	p := jwt.Parser{ValidMethods: []string{jwt.SigningMethodHS256.Name}}

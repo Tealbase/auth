@@ -3,17 +3,15 @@ package api
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 
 	"github.com/coreos/go-oidc/v3/oidc"
-	"github.com/tealbase/gotrue/internal/api/provider"
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/models"
-	"github.com/tealbase/gotrue/internal/observability"
-	"github.com/tealbase/gotrue/internal/storage"
+	"github.com/tealbase/auth/internal/api/provider"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/models"
+	"github.com/tealbase/auth/internal/observability"
+	"github.com/tealbase/auth/internal/storage"
 )
 
 // IdTokenGrantParams are the parameters the IdTokenGrant method accepts
@@ -26,7 +24,7 @@ type IdTokenGrantParams struct {
 	Issuer      string `json:"issuer"`
 }
 
-func (p *IdTokenGrantParams) getProvider(ctx context.Context, config *conf.GlobalConfiguration, r *http.Request) (*oidc.Provider, string, []string, error) {
+func (p *IdTokenGrantParams) getProvider(ctx context.Context, config *conf.GlobalConfiguration, r *http.Request) (*oidc.Provider, *conf.OAuthProviderConfiguration, string, []string, error) {
 	log := observability.GetLogEntry(r)
 
 	var cfg *conf.OAuthProviderConfiguration
@@ -51,10 +49,17 @@ func (p *IdTokenGrantParams) getProvider(ctx context.Context, config *conf.Globa
 		issuer = provider.IssuerGoogle
 		acceptableClientIDs = append(acceptableClientIDs, config.External.Google.ClientID...)
 
-	case p.Provider == "azure" || p.Issuer == provider.IssuerAzure:
+	case p.Provider == "azure" || provider.IsAzureIssuer(p.Issuer):
+		issuer = p.Issuer
+		if issuer == "" || !provider.IsAzureIssuer(issuer) {
+			detectedIssuer, err := provider.DetectAzureIDTokenIssuer(ctx, p.IdToken)
+			if err != nil {
+				return nil, nil, "", nil, badRequestError(ErrorCodeValidationFailed, "Unable to detect issuer in ID token for Azure provider").WithInternalError(err)
+			}
+			issuer = detectedIssuer
+		}
 		cfg = &config.External.Azure
 		providerType = "azure"
-		issuer = provider.IssuerAzure
 		acceptableClientIDs = append(acceptableClientIDs, config.External.Azure.ClientID...)
 
 	case p.Provider == "facebook" || p.Issuer == provider.IssuerFacebook:
@@ -68,6 +73,12 @@ func (p *IdTokenGrantParams) getProvider(ctx context.Context, config *conf.Globa
 		providerType = "keycloak"
 		issuer = config.External.Keycloak.URL
 		acceptableClientIDs = append(acceptableClientIDs, config.External.Keycloak.ClientID...)
+
+	case p.Provider == "kakao" || p.Issuer == provider.IssuerKakao:
+		cfg = &config.External.Kakao
+		providerType = "kakao"
+		issuer = provider.IssuerKakao
+		acceptableClientIDs = append(acceptableClientIDs, config.External.Kakao.ClientID...)
 
 	default:
 		log.WithField("issuer", p.Issuer).WithField("client_id", p.ClientID).Warn("Use of POST /token with arbitrary issuer and client_id is deprecated for security reasons. Please switch to using the API with provider only!")
@@ -84,20 +95,20 @@ func (p *IdTokenGrantParams) getProvider(ctx context.Context, config *conf.Globa
 		}
 
 		if !allowed {
-			return nil, "", nil, badRequestError(fmt.Sprintf("Custom OIDC provider %q not allowed", p.Issuer))
+			return nil, nil, "", nil, badRequestError(ErrorCodeValidationFailed, fmt.Sprintf("Custom OIDC provider %q not allowed", p.Provider))
 		}
 	}
 
 	if cfg != nil && !cfg.Enabled {
-		return nil, "", nil, badRequestError(fmt.Sprintf("Provider (issuer %q) is not enabled", issuer))
+		return nil, nil, "", nil, badRequestError(ErrorCodeProviderDisabled, fmt.Sprintf("Provider (issuer %q) is not enabled", issuer))
 	}
 
 	oidcProvider, err := oidc.NewProvider(ctx, issuer)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, "", nil, err
 	}
 
-	return oidcProvider, providerType, acceptableClientIDs, nil
+	return oidcProvider, cfg, providerType, acceptableClientIDs, nil
 }
 
 // IdTokenGrant implements the id_token grant type flow
@@ -108,14 +119,8 @@ func (a *API) IdTokenGrant(ctx context.Context, w http.ResponseWriter, r *http.R
 	config := a.config
 
 	params := &IdTokenGrantParams{}
-
-	body, err := getBodyBytes(r)
-	if err != nil {
-		return badRequestError("Could not read body").WithInternalError(err)
-	}
-
-	if err := json.Unmarshal(body, params); err != nil {
-		return badRequestError("Could not read id token grant params: %v", err)
+	if err := retrieveRequestParams(r, params); err != nil {
+		return err
 	}
 
 	if params.IdToken == "" {
@@ -126,7 +131,7 @@ func (a *API) IdTokenGrant(ctx context.Context, w http.ResponseWriter, r *http.R
 		return oauthError("invalid request", "provider or client_id and issuer required")
 	}
 
-	oidcProvider, providerType, acceptableClientIDs, err := params.getProvider(ctx, config, r)
+	oidcProvider, oauthConfig, providerType, acceptableClientIDs, err := params.getProvider(ctx, config, r)
 	if err != nil {
 		return err
 	}
@@ -137,6 +142,18 @@ func (a *API) IdTokenGrant(ctx context.Context, w http.ResponseWriter, r *http.R
 	})
 	if err != nil {
 		return oauthError("invalid request", "Bad ID token").WithInternalError(err)
+	}
+
+	userData.Metadata.EmailVerified = false
+	for _, email := range userData.Emails {
+		if email.Primary {
+			userData.Metadata.Email = email.Email
+			userData.Metadata.EmailVerified = email.Verified
+			break
+		} else {
+			userData.Metadata.Email = email.Email
+			userData.Metadata.EmailVerified = email.Verified
+		}
 	}
 
 	if idToken.Subject == "" {
@@ -165,16 +182,18 @@ func (a *API) IdTokenGrant(ctx context.Context, w http.ResponseWriter, r *http.R
 		return oauthError("invalid request", "Unacceptable audience in id_token")
 	}
 
-	tokenHasNonce := idToken.Nonce != ""
-	paramsHasNonce := params.Nonce != ""
+	if !oauthConfig.SkipNonceCheck {
+		tokenHasNonce := idToken.Nonce != ""
+		paramsHasNonce := params.Nonce != ""
 
-	if tokenHasNonce != paramsHasNonce {
-		return oauthError("invalid request", "Passed nonce and nonce in id_token should either both exist or not.")
-	} else if tokenHasNonce && paramsHasNonce {
-		// verify nonce to mitigate replay attacks
-		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(params.Nonce)))
-		if hash != idToken.Nonce {
-			return oauthError("invalid nonce", "Nonces mismatch")
+		if tokenHasNonce != paramsHasNonce {
+			return oauthError("invalid request", "Passed nonce and nonce in id_token should either both exist or not.")
+		} else if tokenHasNonce && paramsHasNonce {
+			// verify nonce to mitigate replay attacks
+			hash := fmt.Sprintf("%x", sha256.Sum256([]byte(params.Nonce)))
+			if hash != idToken.Nonce {
+				return oauthError("invalid nonce", "Nonces mismatch")
+			}
 		}
 	}
 
@@ -191,27 +210,30 @@ func (a *API) IdTokenGrant(ctx context.Context, w http.ResponseWriter, r *http.R
 	var token *AccessTokenResponse
 	var grantParams models.GrantParams
 
+	grantParams.FillGrantParams(r)
+
 	if err := db.Transaction(func(tx *storage.Connection) error {
 		var user *models.User
 		var terr error
 
 		user, terr = a.createAccountFromExternalIdentity(tx, r, userData, providerType)
 		if terr != nil {
-			if errors.Is(terr, errReturnNil) {
-				return nil
-			}
-
 			return terr
 		}
 
-		token, terr = a.issueRefreshToken(ctx, tx, user, models.OAuth, grantParams)
+		token, terr = a.issueRefreshToken(r, tx, user, models.OAuth, grantParams)
 		if terr != nil {
 			return terr
 		}
 
 		return nil
 	}); err != nil {
-		return oauthError("server_error", "Internal Server Error").WithInternalError(err)
+		switch err.(type) {
+		case *storage.CommitWithError:
+			return err
+		default:
+			return oauthError("server_error", "Internal Server Error").WithInternalError(err)
+		}
 	}
 
 	return sendJSON(w, http.StatusOK, token)

@@ -9,7 +9,7 @@ import (
 	"net/http/pprof"
 
 	"github.com/sirupsen/logrus"
-	"github.com/tealbase/gotrue/internal/conf"
+	"github.com/tealbase/auth/internal/conf"
 )
 
 func ConfigureProfiler(ctx context.Context, pc *conf.ProfilerConfig) error {

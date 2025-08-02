@@ -9,12 +9,13 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	jwt "github.com/golang-jwt/jwt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"github.com/tealbase/gotrue/internal/conf"
+	"github.com/tealbase/auth/internal/conf"
 )
 
 const (
@@ -45,7 +46,7 @@ func TestMiddlewareFunctions(t *testing.T) {
 func (ts *MiddlewareTestSuite) TestVerifyCaptchaValid() {
 	ts.Config.Security.Captcha.Enabled = true
 
-	adminClaims := &GoTrueClaims{
+	adminClaims := &AccessTokenClaims{
 		Role: "tealbase_admin",
 	}
 	adminJwt, err := jwt.NewWithClaims(jwt.SigningMethodHS256, adminClaims).SignedString([]byte(ts.Config.JWT.Secret))
@@ -176,7 +177,7 @@ func (ts *MiddlewareTestSuite) TestVerifyCaptchaInvalid() {
 			w := httptest.NewRecorder()
 
 			_, err := ts.API.verifyCaptcha(w, req)
-			require.Equal(ts.T(), c.expectedCode, err.(*HTTPError).Code)
+			require.Equal(ts.T(), c.expectedCode, err.(*HTTPError).HTTPStatus)
 			require.Equal(ts.T(), c.expectedMsg, err.(*HTTPError).Message)
 		})
 	}
@@ -201,8 +202,8 @@ func (ts *MiddlewareTestSuite) TestLimitEmailOrPhoneSentHandler() {
 			},
 		},
 		{
-			desc:             "Sms rate limit exceeded",
-			expectedErrorMsg: "429: Sms rate limit exceeded",
+			desc:             "SMS rate limit exceeded",
+			expectedErrorMsg: "429: SMS rate limit exceeded",
 			requestBody: map[string]interface{}{
 				"phone": "+1233456789",
 			},
@@ -269,7 +270,7 @@ func (ts *MiddlewareTestSuite) TestRequireSAMLEnabled() {
 		{
 			desc:        "SAML not enabled",
 			isEnabled:   false,
-			expectedErr: notFoundError("SAML 2.0 is disabled"),
+			expectedErr: notFoundError(ErrorCodeSAMLProviderDisabled, "SAML 2.0 is disabled"),
 		},
 		{
 			desc:        "SAML enabled",
@@ -311,4 +312,26 @@ func TestFunctionHooksUnmarshalJSON(t *testing.T) {
 			}
 		})
 	}
+}
+
+func (ts *MiddlewareTestSuite) TestTimeoutMiddleware() {
+	ts.Config.API.MaxRequestDuration = 5 * time.Microsecond
+	req := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
+	w := httptest.NewRecorder()
+
+	timeoutHandler := ts.API.timeoutMiddleware(ts.Config.API.MaxRequestDuration)
+
+	slowHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Sleep for 1 second to simulate a slow handler which should trigger the timeout
+		time.Sleep(1 * time.Second)
+		ts.API.handler.ServeHTTP(w, r)
+	})
+	timeoutHandler(slowHandler).ServeHTTP(w, req)
+	assert.Equal(ts.T(), http.StatusGatewayTimeout, w.Code)
+
+	var data map[string]interface{}
+	require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&data))
+	require.Equal(ts.T(), ErrorCodeRequestTimeout, data["error_code"])
+	require.Equal(ts.T(), float64(504), data["code"])
+	require.NotNil(ts.T(), data["msg"])
 }

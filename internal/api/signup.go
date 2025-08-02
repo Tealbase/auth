@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
@@ -10,12 +9,11 @@ import (
 	"github.com/fatih/structs"
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
-	"github.com/tealbase/gotrue/internal/api/provider"
-	"github.com/tealbase/gotrue/internal/api/sms_provider"
-	"github.com/tealbase/gotrue/internal/metering"
-	"github.com/tealbase/gotrue/internal/models"
-	"github.com/tealbase/gotrue/internal/storage"
-	"github.com/tealbase/gotrue/internal/utilities"
+	"github.com/tealbase/auth/internal/api/provider"
+	"github.com/tealbase/auth/internal/api/sms_provider"
+	"github.com/tealbase/auth/internal/metering"
+	"github.com/tealbase/auth/internal/models"
+	"github.com/tealbase/auth/internal/storage"
 )
 
 // SignupParams are the parameters the Signup endpoint accepts
@@ -31,22 +29,25 @@ type SignupParams struct {
 	CodeChallenge       string                 `json:"code_challenge"`
 }
 
-func (p *SignupParams) Validate(passwordMinLength int, smsProvider string) error {
+func (a *API) validateSignupParams(ctx context.Context, p *SignupParams) error {
+	config := a.config
+
 	if p.Password == "" {
-		return unprocessableEntityError("Signup requires a valid password")
+		return badRequestError(ErrorCodeValidationFailed, "Signup requires a valid password")
 	}
-	if len(p.Password) < passwordMinLength {
-		return invalidPasswordLengthError(passwordMinLength)
+
+	if err := a.checkPasswordStrength(ctx, p.Password); err != nil {
+		return err
 	}
 	if p.Email != "" && p.Phone != "" {
-		return unprocessableEntityError("Only an email address or phone number should be provided on signup.")
+		return badRequestError(ErrorCodeValidationFailed, "Only an email address or phone number should be provided on signup.")
 	}
-	if p.Provider == "phone" && !sms_provider.IsValidMessageChannel(p.Channel, smsProvider) {
-		return badRequestError(InvalidChannelError)
+	if p.Provider == "phone" && !sms_provider.IsValidMessageChannel(p.Channel, config.Sms.Provider) {
+		return badRequestError(ErrorCodeValidationFailed, InvalidChannelError)
 	}
 	// PKCE not needed as phone signups already return access token in body
 	if p.Phone != "" && p.CodeChallenge != "" {
-		return badRequestError("PKCE not supported for phone signups")
+		return badRequestError(ErrorCodeValidationFailed, "PKCE not supported for phone signups")
 	}
 	if err := validatePKCEParams(p.CodeChallengeMethod, p.CodeChallenge); err != nil {
 		return err
@@ -69,7 +70,40 @@ func (p *SignupParams) ConfigureDefaults() {
 	if p.Phone != "" && p.Channel == "" {
 		p.Channel = sms_provider.SMSProvider
 	}
+}
 
+func (params *SignupParams) ToUserModel(isSSOUser bool) (user *models.User, err error) {
+	switch params.Provider {
+	case "email":
+		user, err = models.NewUser("", params.Email, params.Password, params.Aud, params.Data)
+	case "phone":
+		user, err = models.NewUser(params.Phone, "", params.Password, params.Aud, params.Data)
+	case "anonymous":
+		user, err = models.NewUser("", "", "", params.Aud, params.Data)
+		user.IsAnonymous = true
+	default:
+		// handles external provider case
+		user, err = models.NewUser("", params.Email, params.Password, params.Aud, params.Data)
+	}
+	if err != nil {
+		err = internalServerError("Database error creating user").WithInternalError(err)
+		return
+	}
+	user.IsSSOUser = isSSOUser
+	if user.AppMetaData == nil {
+		user.AppMetaData = make(map[string]interface{})
+	}
+
+	user.Identities = make([]models.Identity, 0)
+
+	if params.Provider != "anonymous" {
+		// TODO: Deprecate "provider" field
+		user.AppMetaData["provider"] = params.Provider
+
+		user.AppMetaData["providers"] = []string{params.Provider}
+	}
+
+	return user, nil
 }
 
 // Signup is the endpoint for registering a new user
@@ -79,41 +113,34 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 	db := a.db.WithContext(ctx)
 
 	if config.DisableSignup {
-		return forbiddenError("Signups not allowed for this instance")
+		return unprocessableEntityError(ErrorCodeSignupDisabled, "Signups not allowed for this instance")
 	}
 
 	params := &SignupParams{}
-
-	body, err := getBodyBytes(r)
-	if err != nil {
-		return badRequestError("Could not read body").WithInternalError(err)
-	}
-
-	if err := json.Unmarshal(body, params); err != nil {
-		return badRequestError("Could not read Signup params: %v", err)
-	}
-	params.ConfigureDefaults()
-	if err := params.Validate(config.PasswordMinLength, config.Sms.Provider); err != nil {
+	if err := retrieveRequestParams(r, params); err != nil {
 		return err
 	}
 
-	var codeChallengeMethod models.CodeChallengeMethod
-	flowType := getFlowFromChallenge(params.CodeChallenge)
+	params.ConfigureDefaults()
 
-	if isPKCEFlow(flowType) {
-		if codeChallengeMethod, err = models.ParseCodeChallengeMethod(params.CodeChallengeMethod); err != nil {
-			return err
-		}
+	if err := a.validateSignupParams(ctx, params); err != nil {
+		return err
 	}
+
+	var err error
+	flowType := getFlowFromChallenge(params.CodeChallenge)
 
 	var user *models.User
 	var grantParams models.GrantParams
+
+	grantParams.FillGrantParams(r)
+
 	params.Aud = a.requestAud(ctx, r)
 
 	switch params.Provider {
 	case "email":
 		if !config.External.Email.Enabled {
-			return badRequestError("Email signups are disabled")
+			return badRequestError(ErrorCodeEmailProviderDisabled, "Email signups are disabled")
 		}
 		params.Email, err = validateEmail(params.Email)
 		if err != nil {
@@ -122,7 +149,7 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 		user, err = models.IsDuplicatedEmail(db, params.Email, params.Aud, nil)
 	case "phone":
 		if !config.External.Phone.Enabled {
-			return badRequestError("Phone signups are disabled")
+			return badRequestError(ErrorCodePhoneProviderDisabled, "Phone signups are disabled")
 		}
 		params.Phone, err = validatePhone(params.Phone)
 		if err != nil {
@@ -130,11 +157,32 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 		}
 		user, err = models.FindUserByPhoneAndAudience(db, params.Phone, params.Aud)
 	default:
-		return invalidSignupError(config)
+		msg := ""
+		if config.External.Email.Enabled && config.External.Phone.Enabled {
+			msg = "Sign up only available with email or phone provider"
+		} else if config.External.Email.Enabled {
+			msg = "Sign up only available with email provider"
+		} else if config.External.Phone.Enabled {
+			msg = "Sign up only available with phone provider"
+		} else {
+			msg = "Sign up with this provider not possible"
+		}
+
+		return badRequestError(ErrorCodeValidationFailed, msg)
 	}
 
 	if err != nil && !models.IsNotFoundError(err) {
 		return internalServerError("Database error finding user").WithInternalError(err)
+	}
+
+	var signupUser *models.User
+	if user == nil {
+		// always call this outside of a database transaction as this method
+		// can be computationally hard and block due to password hashing
+		signupUser, err = params.ToUserModel(false /* <- isSSOUser */)
+		if err != nil {
+			return err
+		}
 	}
 
 	err = db.Transaction(func(tx *storage.Connection) error {
@@ -143,22 +191,36 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 			if (params.Provider == "email" && user.IsConfirmed()) || (params.Provider == "phone" && user.IsPhoneConfirmed()) {
 				return UserExistsError
 			}
-
 			// do not update the user because we can't be sure of their claimed identity
 		} else {
-			user, terr = a.signupNewUser(ctx, tx, params, false /* <- isSSOUser */)
+			user, terr = a.signupNewUser(tx, signupUser)
 			if terr != nil {
 				return terr
 			}
-			identity, terr := a.createNewIdentity(tx, user, params.Provider, structs.Map(provider.Claims{
+		}
+		identity, terr := models.FindIdentityByIdAndProvider(tx, user.ID.String(), params.Provider)
+		if terr != nil {
+			if !models.IsNotFoundError(terr) {
+				return terr
+			}
+			identityData := structs.Map(provider.Claims{
 				Subject: user.ID.String(),
 				Email:   user.GetEmail(),
-			}))
+			})
+			for k, v := range params.Data {
+				if _, ok := identityData[k]; !ok {
+					identityData[k] = v
+				}
+			}
+			identity, terr = a.createNewIdentity(tx, user, params.Provider, identityData)
 			if terr != nil {
 				return terr
 			}
-			user.Identities = []models.Identity{*identity}
+			if terr := user.RemoveUnconfirmedIdentities(tx, identity); terr != nil {
+				return terr
+			}
 		}
+		user.Identities = []models.Identity{*identity}
 
 		if params.Provider == "email" && !user.IsConfirmed() {
 			if config.Mailer.Autoconfirm {
@@ -167,31 +229,26 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 				}); terr != nil {
 					return terr
 				}
-				if terr = triggerEventHooks(ctx, tx, SignupEvent, user, config); terr != nil {
-					return terr
-				}
 				if terr = user.Confirm(tx); terr != nil {
 					return internalServerError("Database error updating user").WithInternalError(terr)
 				}
 			} else {
-				mailer := a.Mailer(ctx)
-				referrer := utilities.GetReferrer(r, config)
 				if terr = models.NewAuditLogEntry(r, tx, user, models.UserConfirmationRequestedAction, "", map[string]interface{}{
 					"provider": params.Provider,
 				}); terr != nil {
 					return terr
 				}
-				if ok := isPKCEFlow(flowType); ok {
-					if terr := models.NewFlowStateWithUserID(tx, params.Provider, params.CodeChallenge, codeChallengeMethod, models.EmailSignup, &user.ID); terr != nil {
+				if isPKCEFlow(flowType) {
+					_, terr := generateFlowState(tx, params.Provider, models.EmailSignup, params.CodeChallengeMethod, params.CodeChallenge, &user.ID)
+					if terr != nil {
 						return terr
 					}
 				}
-				externalURL := getExternalHost(ctx)
-				if terr = sendConfirmation(tx, user, mailer, config.SMTP.MaxFrequency, referrer, externalURL, config.Mailer.OtpLength, flowType); terr != nil {
+				if terr = a.sendConfirmation(r, tx, user, flowType); terr != nil {
 					if errors.Is(terr, MaxFrequencyLimitError) {
 						now := time.Now()
 						left := user.ConfirmationSentAt.Add(config.SMTP.MaxFrequency).Sub(now) / time.Second
-						return tooManyRequestsError(fmt.Sprintf("For security purposes, you can only request this after %d seconds.", left))
+						return tooManyRequestsError(ErrorCodeOverEmailSendRateLimit, fmt.Sprintf("For security purposes, you can only request this after %d seconds.", left))
 					}
 					return internalServerError("Error sending confirmation mail").WithInternalError(terr)
 				}
@@ -202,9 +259,6 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 					"provider": params.Provider,
 					"channel":  params.Channel,
 				}); terr != nil {
-					return terr
-				}
-				if terr = triggerEventHooks(ctx, tx, SignupEvent, user, config); terr != nil {
 					return terr
 				}
 				if terr = user.ConfirmPhone(tx); terr != nil {
@@ -218,10 +272,10 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 				}
 				smsProvider, terr := sms_provider.GetSmsProvider(*config)
 				if terr != nil {
-					return badRequestError("Error sending confirmation sms: %v", terr)
+					return internalServerError("Unable to get SMS provider").WithInternalError(terr)
 				}
-				if _, terr := a.sendPhoneConfirmation(ctx, tx, user, params.Phone, phoneConfirmationOtp, smsProvider, params.Channel); terr != nil {
-					return badRequestError("Error sending confirmation sms: %v", terr)
+				if _, terr := a.sendPhoneConfirmation(ctx, r, tx, user, params.Phone, phoneConfirmationOtp, smsProvider, params.Channel); terr != nil {
+					return unprocessableEntityError(ErrorCodeSMSSendFailed, "Error sending confirmation sms: %v", terr).WithInternalError(terr)
 				}
 			}
 		}
@@ -230,10 +284,14 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 	})
 
 	if err != nil {
-		if errors.Is(err, MaxFrequencyLimitError) {
-			return tooManyRequestsError("For security purposes, you can only request this once every minute")
+		reason := ErrorCodeOverEmailSendRateLimit
+		if params.Provider == "phone" {
+			reason = ErrorCodeOverSMSSendRateLimit
 		}
-		if errors.Is(err, UserExistsError) {
+
+		if errors.Is(err, MaxFrequencyLimitError) {
+			return tooManyRequestsError(reason, "For security purposes, you can only request this once every minute")
+		} else if errors.Is(err, UserExistsError) {
 			err = db.Transaction(func(tx *storage.Connection) error {
 				if terr := models.NewAuditLogEntry(r, tx, user, models.UserRepeatedSignUpAction, "", map[string]interface{}{
 					"provider": params.Provider,
@@ -246,7 +304,7 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 				return err
 			}
 			if config.Mailer.Autoconfirm || config.Sms.Autoconfirm {
-				return badRequestError("User already registered")
+				return unprocessableEntityError(ErrorCodeUserAlreadyExists, "User already registered")
 			}
 			sanitizedUser, err := sanitizeUser(user, params)
 			if err != nil {
@@ -267,10 +325,7 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 			}); terr != nil {
 				return terr
 			}
-			if terr = triggerEventHooks(ctx, tx, LoginEvent, user, config); terr != nil {
-				return terr
-			}
-			token, terr = a.issueRefreshToken(ctx, tx, user, models.PasswordGrant, grantParams)
+			token, terr = a.issueRefreshToken(r, tx, user, models.PasswordGrant, grantParams)
 
 			if terr != nil {
 				return terr
@@ -302,6 +357,7 @@ func sanitizeUser(u *models.User, params *SignupParams) (*models.User, error) {
 
 	u.ID = uuid.Must(uuid.NewV4())
 
+	u.Role = ""
 	u.CreatedAt, u.UpdatedAt, u.ConfirmationSentAt = now, now, &now
 	u.LastSignInAt, u.ConfirmedAt, u.EmailConfirmedAt, u.PhoneConfirmedAt = nil, nil, nil, nil
 	u.Identities = make([]models.Identity, 0)
@@ -327,39 +383,10 @@ func sanitizeUser(u *models.User, params *SignupParams) (*models.User, error) {
 	return u, nil
 }
 
-func (a *API) signupNewUser(ctx context.Context, conn *storage.Connection, params *SignupParams, isSSOUser bool) (*models.User, error) {
+func (a *API) signupNewUser(conn *storage.Connection, user *models.User) (*models.User, error) {
 	config := a.config
 
-	var user *models.User
-	var err error
-	switch params.Provider {
-	case "email":
-		user, err = models.NewUser("", params.Email, params.Password, params.Aud, params.Data)
-	case "phone":
-		user, err = models.NewUser(params.Phone, "", params.Password, params.Aud, params.Data)
-	default:
-		// handles external provider case
-		user, err = models.NewUser("", params.Email, params.Password, params.Aud, params.Data)
-	}
-	if err != nil {
-		return nil, internalServerError("Database error creating user").WithInternalError(err)
-	}
-	user.IsSSOUser = isSSOUser
-	if user.AppMetaData == nil {
-		user.AppMetaData = make(map[string]interface{})
-	}
-
-	user.Identities = make([]models.Identity, 0)
-
-	// TODO: Deprecate "provider" field
-	user.AppMetaData["provider"] = params.Provider
-
-	user.AppMetaData["providers"] = []string{params.Provider}
-	if params.Password == "" {
-		user.EncryptedPassword = ""
-	}
-
-	err = conn.Transaction(func(tx *storage.Connection) error {
+	err := conn.Transaction(func(tx *storage.Connection) error {
 		var terr error
 		if terr = tx.Create(user); terr != nil {
 			return internalServerError("Database error saving new user").WithInternalError(terr)
@@ -367,20 +394,16 @@ func (a *API) signupNewUser(ctx context.Context, conn *storage.Connection, param
 		if terr = user.SetRole(tx, config.JWT.DefaultGroupName); terr != nil {
 			return internalServerError("Database error updating user").WithInternalError(terr)
 		}
-		if terr = triggerEventHooks(ctx, tx, ValidateEvent, user, config); terr != nil {
-			return terr
-		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	// sometimes there may be triggers in the database that will modify the
+	// there may be triggers or generated column values in the database that will modify the
 	// user data as it is being inserted. thus we load the user object
 	// again to fetch those changes.
-	err = conn.Eager().Load(user)
-	if err != nil {
+	if err := conn.Reload(user); err != nil {
 		return nil, internalServerError("Database error loading user after sign-up").WithInternalError(err)
 	}
 

@@ -8,7 +8,7 @@ import (
 	"github.com/gobuffalo/pop/v6"
 	"github.com/gobuffalo/pop/v6/logging"
 	"github.com/sirupsen/logrus"
-	"github.com/tealbase/gotrue/internal/conf"
+	"github.com/tealbase/auth/internal/conf"
 	"go.opentelemetry.io/otel"
 )
 

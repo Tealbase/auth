@@ -1,7 +1,7 @@
 //lint:file-ignore U1000 ignore go-swagger template
 package docs
 
-import "github.com/tealbase/gotrue/internal/api"
+import "github.com/tealbase/auth/internal/api"
 
 // swagger:route GET /settings settings settings
 // Returns the configuration settings for the gotrue server.

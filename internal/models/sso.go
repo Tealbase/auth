@@ -11,7 +11,7 @@ import (
 	"github.com/crewjam/saml/samlsp"
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
-	"github.com/tealbase/gotrue/internal/storage"
+	"github.com/tealbase/auth/internal/storage"
 )
 
 type SSOProvider struct {
@@ -36,6 +36,7 @@ type SAMLAttribute struct {
 	Name    string      `json:"name,omitempty"`
 	Names   []string    `json:"names,omitempty"`
 	Default interface{} `json:"default,omitempty"`
+	Array   bool        `json:"array,omitempty"`
 }
 
 type SAMLAttributeMapping struct {
@@ -78,6 +79,10 @@ func (m *SAMLAttributeMapping) Equal(o *SAMLAttributeMapping) bool {
 		if mvalue.Default != value.Default {
 			return false
 		}
+
+		if mvalue.Array != value.Array {
+			return false
+		}
 	}
 
 	return true
@@ -115,6 +120,8 @@ type SAMLProvider struct {
 
 	AttributeMapping SAMLAttributeMapping `db:"attribute_mapping" json:"attribute_mapping,omitempty"`
 
+	NameIDFormat *string `db:"name_id_format" json:"name_id_format,omitempty"`
+
 	CreatedAt time.Time `db:"created_at" json:"-"`
 	UpdatedAt time.Time `db:"updated_at" json:"-"`
 }
@@ -148,9 +155,8 @@ type SAMLRelayState struct {
 
 	SSOProviderID uuid.UUID `db:"sso_provider_id"`
 
-	RequestID     string  `db:"request_id"`
-	ForEmail      *string `db:"for_email"`
-	FromIPAddress string  `db:"from_ip_address"`
+	RequestID string  `db:"request_id"`
+	ForEmail  *string `db:"for_email"`
 
 	RedirectTo string `db:"redirect_to"`
 

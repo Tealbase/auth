@@ -2,8 +2,8 @@
 package docs
 
 import (
-	"github.com/tealbase/gotrue/internal/api"
-	"github.com/tealbase/gotrue/internal/models"
+	"github.com/tealbase/auth/internal/api"
+	"github.com/tealbase/auth/internal/models"
 )
 
 // swagger:route GET /user user user-get

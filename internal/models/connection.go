@@ -2,7 +2,7 @@ package models
 
 import (
 	"github.com/gobuffalo/pop/v6"
-	"github.com/tealbase/gotrue/internal/storage"
+	"github.com/tealbase/auth/internal/storage"
 )
 
 type Pagination struct {

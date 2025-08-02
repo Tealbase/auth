@@ -12,7 +12,7 @@ import (
 
 	"fmt"
 	"github.com/pkg/errors"
-	"github.com/tealbase/gotrue/internal/utilities"
+	"github.com/tealbase/auth/internal/utilities"
 )
 
 type GotrueRequest struct {

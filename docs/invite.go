@@ -1,7 +1,7 @@
 //lint:file-ignore U1000 ignore go-swagger template
 package docs
 
-import "github.com/tealbase/gotrue/internal/api"
+import "github.com/tealbase/auth/internal/api"
 
 // swagger:route POST /invite invite invite
 // Sends an invite link to the user.

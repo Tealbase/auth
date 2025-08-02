@@ -3,16 +3,19 @@ package api
 import (
 	"bytes"
 	"context"
+	"net/http"
 	"regexp"
 	"strings"
 	"text/template"
 	"time"
 
+	"github.com/tealbase/auth/internal/hooks"
+
 	"github.com/pkg/errors"
-	"github.com/tealbase/gotrue/internal/api/sms_provider"
-	"github.com/tealbase/gotrue/internal/crypto"
-	"github.com/tealbase/gotrue/internal/models"
-	"github.com/tealbase/gotrue/internal/storage"
+	"github.com/tealbase/auth/internal/api/sms_provider"
+	"github.com/tealbase/auth/internal/crypto"
+	"github.com/tealbase/auth/internal/models"
+	"github.com/tealbase/auth/internal/storage"
 )
 
 var e164Format = regexp.MustCompile("^[1-9][0-9]{1,14}$")
@@ -25,7 +28,7 @@ const (
 func validatePhone(phone string) (string, error) {
 	phone = formatPhoneNumber(phone)
 	if isValid := validateE164Format(phone); !isValid {
-		return "", unprocessableEntityError("Invalid phone number format (E.164 required)")
+		return "", badRequestError(ErrorCodeValidationFailed, "Invalid phone number format (E.164 required)")
 	}
 	return phone, nil
 }
@@ -41,7 +44,7 @@ func formatPhoneNumber(phone string) string {
 }
 
 // sendPhoneConfirmation sends an otp to the user's phone number
-func (a *API) sendPhoneConfirmation(ctx context.Context, tx *storage.Connection, user *models.User, phone, otpType string, smsProvider sms_provider.SmsProvider, channel string) (string, error) {
+func (a *API) sendPhoneConfirmation(ctx context.Context, r *http.Request, tx *storage.Connection, user *models.User, phone, otpType string, smsProvider sms_provider.SmsProvider, channel string) (string, error) {
 	config := a.config
 
 	var token *string
@@ -92,10 +95,24 @@ func (a *API) sendPhoneConfirmation(ctx context.Context, tx *storage.Connection,
 		if err != nil {
 			return "", err
 		}
+		if config.Hook.SendSMS.Enabled {
+			input := hooks.SendSMSInput{
+				User: user,
+				SMS: hooks.SMS{
+					OTP: otp,
+				},
+			}
+			output := hooks.SendSMSOutput{}
+			err := a.invokeHook(tx, r, &input, &output, a.config.Hook.SendSMS.URI)
+			if err != nil {
+				return "", err
+			}
+		} else {
 
-		messageID, err = smsProvider.SendMessage(phone, message, channel)
-		if err != nil {
-			return messageID, err
+			messageID, err = smsProvider.SendMessage(phone, message, channel, otp)
+			if err != nil {
+				return messageID, err
+			}
 		}
 	}
 

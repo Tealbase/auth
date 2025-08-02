@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/tealbase/gotrue/internal/models"
-	"github.com/tealbase/gotrue/internal/observability"
-	"github.com/tealbase/gotrue/internal/security"
+	"github.com/tealbase/auth/internal/models"
+	"github.com/tealbase/auth/internal/observability"
+	"github.com/tealbase/auth/internal/security"
 	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/didip/tollbooth/v5"
@@ -66,7 +68,7 @@ func (a *API) limitHandler(lmt *limiter.Limiter) middlewareHandler {
 			} else {
 				err := tollbooth.LimitByKeys(lmt, []string{key})
 				if err != nil {
-					return c, httpError(http.StatusTooManyRequests, "Rate limit exceeded")
+					return c, tooManyRequestsError(ErrorCodeOverRequestRateLimit, "Request rate limit reached")
 				}
 			}
 		}
@@ -95,18 +97,13 @@ func (a *API) limitEmailOrPhoneSentHandler() middlewareHandler {
 
 		if shouldRateLimitEmail || shouldRateLimitPhone {
 			if req.Method == "PUT" || req.Method == "POST" {
-				bodyBytes, err := getBodyBytes(req)
-				if err != nil {
-					return c, internalServerError("Error invalid request body").WithInternalError(err)
-				}
-
 				var requestBody struct {
 					Email string `json:"email"`
 					Phone string `json:"phone"`
 				}
 
-				if err := json.Unmarshal(bodyBytes, &requestBody); err != nil {
-					return c, badRequestError("Error invalid request body").WithInternalError(err)
+				if err := retrieveRequestParams(req, &requestBody); err != nil {
+					return c, err
 				}
 
 				if shouldRateLimitEmail {
@@ -117,7 +114,7 @@ func (a *API) limitEmailOrPhoneSentHandler() middlewareHandler {
 								1,
 								attribute.String("path", req.URL.Path),
 							)
-							return c, httpError(http.StatusTooManyRequests, "Email rate limit exceeded")
+							return c, tooManyRequestsError(ErrorCodeOverEmailSendRateLimit, "Email rate limit exceeded")
 						}
 					}
 				}
@@ -125,7 +122,7 @@ func (a *API) limitEmailOrPhoneSentHandler() middlewareHandler {
 				if shouldRateLimitPhone {
 					if requestBody.Phone != "" {
 						if err := tollbooth.LimitByKeys(phoneLimiter, []string{"phone_functions"}); err != nil {
-							return c, httpError(http.StatusTooManyRequests, "Sms rate limit exceeded")
+							return c, tooManyRequestsError(ErrorCodeOverSMSSendRateLimit, "SMS rate limit exceeded")
 						}
 					}
 				}
@@ -148,7 +145,7 @@ func (a *API) requireAdminCredentials(w http.ResponseWriter, req *http.Request) 
 		return nil, err
 	}
 
-	return a.requireAdmin(ctx, w, req)
+	return a.requireAdmin(ctx, req)
 }
 
 func (a *API) requireEmailProvider(w http.ResponseWriter, req *http.Request) (context.Context, error) {
@@ -156,7 +153,7 @@ func (a *API) requireEmailProvider(w http.ResponseWriter, req *http.Request) (co
 	config := a.config
 
 	if !config.External.Email.Enabled {
-		return nil, badRequestError("Email logins are disabled")
+		return nil, badRequestError(ErrorCodeEmailProviderDisabled, "Email logins are disabled")
 	}
 
 	return ctx, nil
@@ -183,8 +180,7 @@ func (a *API) verifyCaptcha(w http.ResponseWriter, req *http.Request) (context.C
 	}
 
 	if !verificationResult.Success {
-		return nil, badRequestError("captcha protection: request disallowed (%s)", strings.Join(verificationResult.ErrorCodes, ", "))
-
+		return nil, badRequestError(ErrorCodeCaptchaFailed, "captcha protection: request disallowed (%s)", strings.Join(verificationResult.ErrorCodes, ", "))
 	}
 
 	return ctx, nil
@@ -228,31 +224,134 @@ func (a *API) isValidExternalHost(w http.ResponseWriter, req *http.Request) (con
 func (a *API) requireSAMLEnabled(w http.ResponseWriter, req *http.Request) (context.Context, error) {
 	ctx := req.Context()
 	if !a.config.SAML.Enabled {
-		return nil, notFoundError("SAML 2.0 is disabled")
+		return nil, notFoundError(ErrorCodeSAMLProviderDisabled, "SAML 2.0 is disabled")
 	}
 	return ctx, nil
 }
 
-func (a *API) databaseCleanup(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(w, r)
+func (a *API) requireManualLinkingEnabled(w http.ResponseWriter, req *http.Request) (context.Context, error) {
+	ctx := req.Context()
+	if !a.config.Security.ManualLinkingEnabled {
+		return nil, notFoundError(ErrorCodeManualLinkingDisabled, "Manual linking is disabled")
+	}
+	return ctx, nil
+}
 
-		switch r.Method {
-		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
-			// continue
+func (a *API) databaseCleanup(cleanup *models.Cleanup) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r)
 
-		default:
+			switch r.Method {
+			case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+				// continue
+
+			default:
+				return
+			}
+
+			db := a.db.WithContext(r.Context())
+			log := observability.GetLogEntry(r)
+
+			affectedRows, err := cleanup.Clean(db)
+			if err != nil {
+				log.WithError(err).WithField("affected_rows", affectedRows).Warn("database cleanup failed")
+			} else if affectedRows > 0 {
+				log.WithField("affected_rows", affectedRows).Debug("cleaned up expired or stale rows")
+			}
+		})
+	}
+}
+
+// timeoutResponseWriter is a http.ResponseWriter that prevents subsequent
+// writes after the context contained in it has exceeded the deadline. If a
+// partial write occurs before the deadline is exceeded, but the writing is not
+// complete it will allow further writes.
+type timeoutResponseWriter struct {
+	ctx   context.Context
+	w     http.ResponseWriter
+	wrote int32
+	mu    sync.Mutex
+}
+
+func (t *timeoutResponseWriter) Header() http.Header {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.w.Header()
+}
+
+func (t *timeoutResponseWriter) Write(bytes []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.ctx.Err() == context.DeadlineExceeded {
+		if atomic.LoadInt32(&t.wrote) == 0 {
+			return 0, context.DeadlineExceeded
+		}
+
+		// writing started before the deadline exceeded, but the
+		// deadline came in the middle, so letting the writes go
+		// through
+	}
+
+	t.wrote = 1
+
+	return t.w.Write(bytes)
+}
+
+func (t *timeoutResponseWriter) WriteHeader(statusCode int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.ctx.Err() == context.DeadlineExceeded {
+		if atomic.LoadInt32(&t.wrote) == 0 {
 			return
 		}
 
-		db := a.db.WithContext(r.Context())
-		log := observability.GetLogEntry(r)
+		// writing started before the deadline exceeded, but the
+		// deadline came in the middle, so letting the writes go
+		// through
+	}
 
-		affectedRows, err := models.Cleanup(db)
-		if err != nil {
-			log.WithError(err).WithField("affected_rows", affectedRows).Warn("database cleanup failed")
-		} else if affectedRows > 0 {
-			log.WithField("affected_rows", affectedRows).Debug("cleaned up expired or stale rows")
-		}
-	})
+	t.wrote = 1
+
+	t.w.WriteHeader(statusCode)
+}
+
+func (a *API) timeoutMiddleware(timeout time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithTimeout(r.Context(), timeout)
+			defer cancel()
+
+			timeoutWriter := &timeoutResponseWriter{
+				w:   w,
+				ctx: ctx,
+			}
+
+			go func() {
+				<-ctx.Done()
+
+				err := ctx.Err()
+
+				if err == context.DeadlineExceeded {
+					timeoutWriter.mu.Lock()
+					defer timeoutWriter.mu.Unlock()
+					if timeoutWriter.wrote == 0 {
+						// writer wasn't written to, so we're sending the error payload
+
+						httpError := &HTTPError{
+							HTTPStatus: http.StatusGatewayTimeout,
+							ErrorCode:  ErrorCodeRequestTimeout,
+							Message:    "Processing this request timed out, please retry after a moment.",
+						}
+
+						httpError = httpError.WithInternalError(err)
+
+						HandleResponseError(httpError, w, r)
+					}
+				}
+			}()
+
+			next.ServeHTTP(timeoutWriter, r.WithContext(ctx))
+		})
+	}
 }

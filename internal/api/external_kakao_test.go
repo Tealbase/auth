@@ -10,8 +10,8 @@ import (
 
 	jwt "github.com/golang-jwt/jwt"
 	"github.com/stretchr/testify/require"
-	"github.com/tealbase/gotrue/internal/api/provider"
-	"github.com/tealbase/gotrue/internal/models"
+	"github.com/tealbase/auth/internal/api/provider"
+	"github.com/tealbase/auth/internal/models"
 )
 
 func (ts *ExternalTestSuite) TestSignupExternalKakao() {
@@ -63,25 +63,33 @@ func KakaoTestSignupSetup(ts *ExternalTestSuite, tokenCount *int, userCount *int
 				}
 			}
 
-			if email == nil {
-				w.WriteHeader(400)
-				return
-			}
-
 			w.Header().Add("Content-Type", "application/json")
-			fmt.Fprintf(w, `
-				{
-					"id":123, 
-					"kakao_account": {
-						"profile": {
-							"nickname":"Kakao Test",
-							"profile_image_url":"http://example.com/avatar"
-						},
-						"email": "%v",
-						"is_email_valid": %v,
-						"is_email_verified": %v
-					}
-				}`, email.Email, email.Verified, email.Verified)
+			if email != nil {
+				fmt.Fprintf(w, `
+					{
+						"id":123, 
+						"kakao_account": {
+							"profile": {
+								"nickname":"Kakao Test",
+								"profile_image_url":"http://example.com/avatar"
+							},
+							"email": "%v",
+							"is_email_valid": %v,
+							"is_email_verified": %v
+						}
+					}`, email.Email, email.Verified, email.Verified)
+			} else {
+				fmt.Fprint(w, `
+					{
+						"id":123, 
+						"kakao_account": {
+							"profile": {
+								"nickname":"Kakao Test",
+								"profile_image_url":"http://example.com/avatar"
+							}
+						}
+					}`)
+			}
 		default:
 			w.WriteHeader(500)
 			ts.Fail("unknown kakao oauth call %s", r.URL.Path)
@@ -197,6 +205,7 @@ func (ts *ExternalTestSuite) TestInviteTokenExternalKakaoErrorWhenEmailDoesntMat
 }
 
 func (ts *ExternalTestSuite) TestSignupExternalKakaoErrorWhenVerifiedFalse() {
+	ts.Config.Mailer.AllowUnverifiedEmailSignIns = false
 	tokenCount, userCount := 0, 0
 	code := "authcode"
 	emails := `[{"email":"kakao@example.com", "primary": true, "verified": false}]`
@@ -205,12 +214,7 @@ func (ts *ExternalTestSuite) TestSignupExternalKakaoErrorWhenVerifiedFalse() {
 
 	u := performAuthorization(ts, "kakao", code, "")
 
-	v, err := url.ParseQuery(u.Fragment)
-	ts.Require().NoError(err)
-	ts.Equal("unauthorized_client", v.Get("error"))
-	ts.Equal("401", v.Get("error_code"))
-	ts.Equal("Unverified email with kakao", v.Get("error_description"))
-	assertAuthorizationFailure(ts, u, "", "", "")
+	assertAuthorizationFailure(ts, u, "Unverified email with kakao. A confirmation email has been sent to your kakao email", "access_denied", "")
 }
 
 func (ts *ExternalTestSuite) TestSignupExternalKakaoErrorWhenUserBanned() {
@@ -230,5 +234,5 @@ func (ts *ExternalTestSuite) TestSignupExternalKakaoErrorWhenUserBanned() {
 	require.NoError(ts.T(), ts.API.db.UpdateOnly(user, "banned_until"))
 
 	u = performAuthorization(ts, "kakao", code, "")
-	assertAuthorizationFailure(ts, u, "User is unauthorized", "unauthorized_client", "")
+	assertAuthorizationFailure(ts, u, "User is banned", "access_denied", "")
 }

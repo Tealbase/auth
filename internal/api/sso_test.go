@@ -14,8 +14,8 @@ import (
 	jwt "github.com/golang-jwt/jwt"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/models"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/models"
 )
 
 const dateInPast = "2001-02-03T04:05:06.789"
@@ -47,7 +47,7 @@ func TestSSO(t *testing.T) {
 func (ts *SSOTestSuite) SetupTest() {
 	models.TruncateAll(ts.API.db)
 
-	claims := &GoTrueClaims{
+	claims := &AccessTokenClaims{
 		Role: "tealbase_admin",
 	}
 	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(ts.Config.JWT.Secret))
@@ -277,7 +277,7 @@ func (ts *SSOTestSuite) TestAdminCreateSSOProvider() {
 			},
 		},
 		{
-			StatusCode: http.StatusBadRequest,
+			StatusCode: http.StatusUnprocessableEntity,
 			Request: map[string]interface{}{
 				"type":         "saml",
 				"metadata_xml": validSAMLIDPMetadata("https://accounts.google.com/o/saml2?idpid=EXAMPLE-DUPLICATE"),

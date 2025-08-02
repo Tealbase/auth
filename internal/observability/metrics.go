@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"github.com/tealbase/gotrue/internal/conf"
+	"github.com/tealbase/auth/internal/conf"
 
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"

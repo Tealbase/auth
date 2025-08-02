@@ -5,9 +5,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/storage"
-	"github.com/tealbase/gotrue/internal/storage/test"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/storage"
+	"github.com/tealbase/auth/internal/storage/test"
 )
 
 type SSOTestSuite struct {

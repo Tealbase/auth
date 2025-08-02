@@ -8,9 +8,9 @@ import (
 
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/models"
-	"github.com/tealbase/gotrue/internal/utilities"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/models"
+	"github.com/tealbase/auth/internal/utilities"
 )
 
 func addRequestID(globalConfig *conf.GlobalConfiguration) middlewareHandler {
@@ -74,4 +74,42 @@ func isStringInSlice(checkValue string, list []string) bool {
 // getBodyBytes returns a byte array of the request's Body.
 func getBodyBytes(req *http.Request) ([]byte, error) {
 	return utilities.GetBodyBytes(req)
+}
+
+type RequestParams interface {
+	AdminUserParams |
+		CreateSSOProviderParams |
+		EnrollFactorParams |
+		GenerateLinkParams |
+		IdTokenGrantParams |
+		InviteParams |
+		OtpParams |
+		PKCEGrantParams |
+		PasswordGrantParams |
+		RecoverParams |
+		RefreshTokenGrantParams |
+		ResendConfirmationParams |
+		SignupParams |
+		SingleSignOnParams |
+		SmsParams |
+		UserUpdateParams |
+		VerifyFactorParams |
+		VerifyParams |
+		adminUserUpdateFactorParams |
+		struct {
+			Email string `json:"email"`
+			Phone string `json:"phone"`
+		}
+}
+
+// retrieveRequestParams is a generic method that unmarshals the request body into the params struct provided
+func retrieveRequestParams[A RequestParams](r *http.Request, params *A) error {
+	body, err := getBodyBytes(r)
+	if err != nil {
+		return internalServerError("Could not read body into byte slice").WithInternalError(err)
+	}
+	if err := json.Unmarshal(body, params); err != nil {
+		return badRequestError(ErrorCodeBadJSON, "Could not parse request body as JSON: %v", err)
+	}
+	return nil
 }

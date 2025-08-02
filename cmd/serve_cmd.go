@@ -6,10 +6,10 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"github.com/tealbase/gotrue/internal/api"
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/storage"
-	"github.com/tealbase/gotrue/internal/utilities"
+	"github.com/tealbase/auth/internal/api"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/storage"
+	"github.com/tealbase/auth/internal/utilities"
 )
 
 var serveCmd = cobra.Command{

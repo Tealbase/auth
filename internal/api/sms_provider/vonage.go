@@ -8,8 +8,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/utilities"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/utilities"
 	"golang.org/x/exp/utf8string"
 )
 
@@ -45,7 +45,7 @@ func NewVonageProvider(config conf.VonageProviderConfiguration) (SmsProvider, er
 	}, nil
 }
 
-func (t *VonageProvider) SendMessage(phone string, message string, channel string) (string, error) {
+func (t *VonageProvider) SendMessage(phone, message, channel, otp string) (string, error) {
 	switch channel {
 	case SMSProvider:
 		return t.SendSms(phone, message)

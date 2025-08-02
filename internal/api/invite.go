@@ -1,14 +1,12 @@
 package api
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"github.com/fatih/structs"
-	"github.com/tealbase/gotrue/internal/api/provider"
-	"github.com/tealbase/gotrue/internal/models"
-	"github.com/tealbase/gotrue/internal/storage"
-	"github.com/tealbase/gotrue/internal/utilities"
+	"github.com/tealbase/auth/internal/api/provider"
+	"github.com/tealbase/auth/internal/models"
+	"github.com/tealbase/auth/internal/storage"
 )
 
 // InviteParams are the parameters the Signup endpoint accepts
@@ -21,19 +19,13 @@ type InviteParams struct {
 func (a *API) Invite(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	db := a.db.WithContext(ctx)
-	config := a.config
 	adminUser := getAdminUser(ctx)
 	params := &InviteParams{}
-
-	body, err := getBodyBytes(r)
-	if err != nil {
-		return badRequestError("Could not read body").WithInternalError(err)
+	if err := retrieveRequestParams(r, params); err != nil {
+		return err
 	}
 
-	if err := json.Unmarshal(body, params); err != nil {
-		return badRequestError("Could not read Invite params: %v", err)
-	}
-
+	var err error
 	params.Email, err = validateEmail(params.Email)
 	if err != nil {
 		return err
@@ -48,7 +40,7 @@ func (a *API) Invite(w http.ResponseWriter, r *http.Request) error {
 	err = db.Transaction(func(tx *storage.Connection) error {
 		if user != nil {
 			if user.IsConfirmed() {
-				return unprocessableEntityError(DuplicateEmailMsg)
+				return unprocessableEntityError(ErrorCodeEmailExists, DuplicateEmailMsg)
 			}
 		} else {
 			signupParams := SignupParams{
@@ -57,7 +49,16 @@ func (a *API) Invite(w http.ResponseWriter, r *http.Request) error {
 				Aud:      aud,
 				Provider: "email",
 			}
-			user, err = a.signupNewUser(ctx, tx, &signupParams, false /* <- isSSOUser */)
+
+			// because params above sets no password, this method
+			// is not computationally hard so it can be used within
+			// a database transaction
+			user, err = signupParams.ToUserModel(false /* <- isSSOUser */)
+			if err != nil {
+				return err
+			}
+
+			user, err = a.signupNewUser(tx, user)
 			if err != nil {
 				return err
 			}
@@ -78,10 +79,7 @@ func (a *API) Invite(w http.ResponseWriter, r *http.Request) error {
 			return terr
 		}
 
-		mailer := a.Mailer(ctx)
-		referrer := utilities.GetReferrer(r, config)
-		externalURL := getExternalHost(ctx)
-		if err := sendInvite(tx, user, mailer, referrer, externalURL, config.Mailer.OtpLength); err != nil {
+		if err := a.sendInvite(r, tx, user); err != nil {
 			return internalServerError("Error inviting user").WithInternalError(err)
 		}
 		return nil

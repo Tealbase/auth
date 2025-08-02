@@ -9,7 +9,7 @@ import (
 
 	"github.com/crewjam/saml"
 	"github.com/stretchr/testify/require"
-	"github.com/tealbase/gotrue/internal/conf"
+	"github.com/tealbase/auth/internal/conf"
 )
 
 func TestSAMLMetadataWithAPI(t *tst.T) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"text/template"
 	"time"
@@ -17,7 +18,18 @@ import (
 
 const defaultMinPasswordLength int = 6
 const defaultChallengeExpiryDuration float64 = 300
+const defaultFactorExpiryDuration time.Duration = 300 * time.Second
 const defaultFlowStateExpiryDuration time.Duration = 300 * time.Second
+
+// See: https://www.postgresql.org/docs/7.0/syntax525.htm
+var postgresNamesRegexp = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,62}$`)
+
+// See: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+// We use 4 * Math.ceil(n/3) to obtain unpadded length in base 64
+// So this 4 * Math.ceil(24/3) = 32 and 4 * Math.ceil(64/3) = 88 for symmetric secrets
+// Since Ed25519 key is 32 bytes so we have 4 * Math.ceil(32/3) = 44
+var symmetricSecretFormat = regexp.MustCompile(`^v1,whsec_[A-Za-z0-9+/=]{32,88}`)
+var asymmetricSecretFormat = regexp.MustCompile(`^v1a,whpk_[A-Za-z0-9+/=]{44,}:whsk_[A-Za-z0-9+/=]{44,}$`)
 
 // Time is used to represent timestamps in the configuration, as envconfig has
 // trouble parsing empty strings, due to time.Time.UnmarshalText().
@@ -41,12 +53,17 @@ func (t *Time) UnmarshalText(text []byte) error {
 
 // OAuthProviderConfiguration holds all config related to external account providers.
 type OAuthProviderConfiguration struct {
-	ClientID    []string `json:"client_id" split_words:"true"`
-	Secret      string   `json:"secret"`
-	RedirectURI string   `json:"redirect_uri" split_words:"true"`
-	URL         string   `json:"url"`
-	ApiURL      string   `json:"api_url" split_words:"true"`
-	Enabled     bool     `json:"enabled"`
+	ClientID       []string `json:"client_id" split_words:"true"`
+	Secret         string   `json:"secret"`
+	RedirectURI    string   `json:"redirect_uri" split_words:"true"`
+	URL            string   `json:"url"`
+	ApiURL         string   `json:"api_url" split_words:"true"`
+	Enabled        bool     `json:"enabled"`
+	SkipNonceCheck bool     `json:"skip_nonce_check" split_words:"true"`
+}
+
+type AnonymousProviderConfiguration struct {
+	Enabled bool `json:"enabled" default:"false"`
 }
 
 type EmailProviderConfiguration struct {
@@ -86,19 +103,21 @@ type JWTConfiguration struct {
 
 // MFAConfiguration holds all the MFA related Configuration
 type MFAConfiguration struct {
-	Enabled                     bool    `default:"false"`
-	ChallengeExpiryDuration     float64 `json:"challenge_expiry_duration" default:"300" split_words:"true"`
-	RateLimitChallengeAndVerify float64 `split_words:"true" default:"15"`
-	MaxEnrolledFactors          float64 `split_words:"true" default:"10"`
-	MaxVerifiedFactors          int     `split_words:"true" default:"10"`
+	Enabled                     bool          `default:"false"`
+	ChallengeExpiryDuration     float64       `json:"challenge_expiry_duration" default:"300" split_words:"true"`
+	FactorExpiryDuration        time.Duration `json:"factor_expiry_duration" default:"300s" split_words:"true"`
+	RateLimitChallengeAndVerify float64       `split_words:"true" default:"15"`
+	MaxEnrolledFactors          float64       `split_words:"true" default:"10"`
+	MaxVerifiedFactors          int           `split_words:"true" default:"10"`
 }
 
 type APIConfiguration struct {
-	Host            string
-	Port            string `envconfig:"PORT" default:"8081"`
-	Endpoint        string
-	RequestIDHeader string `envconfig:"REQUEST_ID_HEADER"`
-	ExternalURL     string `json:"external_url" envconfig:"API_EXTERNAL_URL" required:"true"`
+	Host               string
+	Port               string `envconfig:"PORT" default:"8081"`
+	Endpoint           string
+	RequestIDHeader    string        `envconfig:"REQUEST_ID_HEADER"`
+	ExternalURL        string        `json:"external_url" envconfig:"API_EXTERNAL_URL" required:"true"`
+	MaxRequestDuration time.Duration `json:"max_request_duration" split_words:"true" default:"10s"`
 }
 
 func (a *APIConfiguration) Validate() error {
@@ -110,36 +129,113 @@ func (a *APIConfiguration) Validate() error {
 	return nil
 }
 
+type SessionsConfiguration struct {
+	Timebox           *time.Duration `json:"timebox"`
+	InactivityTimeout *time.Duration `json:"inactivity_timeout,omitempty" split_words:"true"`
+
+	SinglePerUser bool     `json:"single_per_user" split_words:"true"`
+	Tags          []string `json:"tags,omitempty"`
+}
+
+func (c *SessionsConfiguration) Validate() error {
+	if c.Timebox == nil {
+		return nil
+	}
+
+	if *c.Timebox <= time.Duration(0) {
+		return fmt.Errorf("conf: session timebox duration must be positive when set, was %v", (*c.Timebox).String())
+	}
+
+	return nil
+}
+
+type PasswordRequiredCharacters []string
+
+func (v *PasswordRequiredCharacters) Decode(value string) error {
+	parts := strings.Split(value, ":")
+
+	for i := 0; i < len(parts)-1; i += 1 {
+		part := parts[i]
+
+		if part == "" {
+			continue
+		}
+
+		// part ended in escape character, so it should be joined with the next one
+		if part[len(part)-1] == '\\' {
+			parts[i] = part[0:len(part)-1] + ":" + parts[i+1]
+			parts[i+1] = ""
+			continue
+		}
+	}
+
+	for _, part := range parts {
+		if part != "" {
+			*v = append(*v, part)
+		}
+	}
+
+	return nil
+}
+
+// HIBPBloomConfiguration configures a bloom cache for pwned passwords. Use
+// this tool to gauge the Items and FalsePositives values:
+// https://hur.st/bloomfilter
+type HIBPBloomConfiguration struct {
+	Enabled        bool    `json:"enabled"`
+	Items          uint    `json:"items" default:"100000"`
+	FalsePositives float64 `json:"false_positives" split_words:"true" default:"0.0000099"`
+}
+
+type HIBPConfiguration struct {
+	Enabled    bool `json:"enabled"`
+	FailClosed bool `json:"fail_closed" split_words:"true"`
+
+	UserAgent string `json:"user_agent" split_words:"true" default:"https://github.com/tealbase/gotrue"`
+
+	Bloom HIBPBloomConfiguration `json:"bloom"`
+}
+
+type PasswordConfiguration struct {
+	MinLength int `json:"min_length" split_words:"true"`
+
+	RequiredCharacters PasswordRequiredCharacters `json:"required_characters" split_words:"true"`
+
+	HIBP HIBPConfiguration `json:"hibp"`
+}
+
 // GlobalConfiguration holds all the configuration that applies to all instances.
 type GlobalConfiguration struct {
-	API                   APIConfiguration
-	DB                    DBConfiguration
-	External              ProviderConfiguration
-	Logging               LoggingConfig  `envconfig:"LOG"`
-	Profiler              ProfilerConfig `envconfig:"PROFILER"`
-	OperatorToken         string         `split_words:"true" required:"false"`
-	Tracing               TracingConfig
-	Metrics               MetricsConfig
-	SMTP                  SMTPConfiguration
-	RateLimitHeader       string  `split_words:"true"`
-	RateLimitEmailSent    float64 `split_words:"true" default:"30"`
-	RateLimitSmsSent      float64 `split_words:"true" default:"30"`
-	RateLimitVerify       float64 `split_words:"true" default:"30"`
-	RateLimitTokenRefresh float64 `split_words:"true" default:"30"`
-	RateLimitSso          float64 `split_words:"true" default:"30"`
+	API                     APIConfiguration
+	DB                      DBConfiguration
+	External                ProviderConfiguration
+	Logging                 LoggingConfig  `envconfig:"LOG"`
+	Profiler                ProfilerConfig `envconfig:"PROFILER"`
+	OperatorToken           string         `split_words:"true" required:"false"`
+	Tracing                 TracingConfig
+	Metrics                 MetricsConfig
+	SMTP                    SMTPConfiguration
+	RateLimitHeader         string  `split_words:"true"`
+	RateLimitEmailSent      float64 `split_words:"true" default:"30"`
+	RateLimitSmsSent        float64 `split_words:"true" default:"30"`
+	RateLimitVerify         float64 `split_words:"true" default:"30"`
+	RateLimitTokenRefresh   float64 `split_words:"true" default:"150"`
+	RateLimitSso            float64 `split_words:"true" default:"30"`
+	RateLimitAnonymousUsers float64 `split_words:"true" default:"30"`
 
-	SiteURL           string   `json:"site_url" split_words:"true" required:"true"`
-	URIAllowList      []string `json:"uri_allow_list" split_words:"true"`
-	URIAllowListMap   map[string]glob.Glob
-	PasswordMinLength int                      `json:"password_min_length" split_words:"true"`
-	JWT               JWTConfiguration         `json:"jwt"`
-	Mailer            MailerConfiguration      `json:"mailer"`
-	Sms               SmsProviderConfiguration `json:"sms"`
-	DisableSignup     bool                     `json:"disable_signup" split_words:"true"`
-	Webhook           WebhookConfig            `json:"webhook" split_words:"true"`
-	Security          SecurityConfiguration    `json:"security"`
-	MFA               MFAConfiguration         `json:"MFA"`
-	Cookie            struct {
+	SiteURL         string   `json:"site_url" split_words:"true" required:"true"`
+	URIAllowList    []string `json:"uri_allow_list" split_words:"true"`
+	URIAllowListMap map[string]glob.Glob
+	Password        PasswordConfiguration    `json:"password"`
+	JWT             JWTConfiguration         `json:"jwt"`
+	Mailer          MailerConfiguration      `json:"mailer"`
+	Sms             SmsProviderConfiguration `json:"sms"`
+	DisableSignup   bool                     `json:"disable_signup" split_words:"true"`
+	Hook            HookConfiguration        `json:"hook" split_words:"true"`
+	Security        SecurityConfiguration    `json:"security"`
+	Sessions        SessionsConfiguration    `json:"sessions"`
+	MFA             MFAConfiguration         `json:"MFA"`
+	Cookie          struct {
 		Key      string `json:"key"`
 		Domain   string `json:"domain"`
 		Duration int    `json:"duration"`
@@ -183,33 +279,34 @@ type EmailContentConfiguration struct {
 }
 
 type ProviderConfiguration struct {
-	Apple                   OAuthProviderConfiguration `json:"apple"`
-	Azure                   OAuthProviderConfiguration `json:"azure"`
-	Bitbucket               OAuthProviderConfiguration `json:"bitbucket"`
-	Discord                 OAuthProviderConfiguration `json:"discord"`
-	Facebook                OAuthProviderConfiguration `json:"facebook"`
-	Figma                   OAuthProviderConfiguration `json:"figma"`
-	Fly                     OAuthProviderConfiguration `json:"fly"`
-	Github                  OAuthProviderConfiguration `json:"github"`
-	Gitlab                  OAuthProviderConfiguration `json:"gitlab"`
-	Google                  OAuthProviderConfiguration `json:"google"`
-	Kakao                   OAuthProviderConfiguration `json:"kakao"`
-	Notion                  OAuthProviderConfiguration `json:"notion"`
-	Keycloak                OAuthProviderConfiguration `json:"keycloak"`
-	Linkedin                OAuthProviderConfiguration `json:"linkedin"`
-	LinkedinOIDC            OAuthProviderConfiguration `json:"linkedin_oidc" envconfig:"LINKEDIN_OIDC"`
-	Spotify                 OAuthProviderConfiguration `json:"spotify"`
-	Slack                   OAuthProviderConfiguration `json:"slack"`
-	Twitter                 OAuthProviderConfiguration `json:"twitter"`
-	Twitch                  OAuthProviderConfiguration `json:"twitch"`
-	WorkOS                  OAuthProviderConfiguration `json:"workos"`
-	Email                   EmailProviderConfiguration `json:"email"`
-	Phone                   PhoneProviderConfiguration `json:"phone"`
-	Zoom                    OAuthProviderConfiguration `json:"zoom"`
-	IosBundleId             string                     `json:"ios_bundle_id" split_words:"true"`
-	RedirectURL             string                     `json:"redirect_url"`
-	AllowedIdTokenIssuers   []string                   `json:"allowed_id_token_issuers" split_words:"true"`
-	FlowStateExpiryDuration time.Duration              `json:"flow_state_expiry_duration" split_words:"true"`
+	AnonymousUsers          AnonymousProviderConfiguration `json:"anonymous_users" split_words:"true"`
+	Apple                   OAuthProviderConfiguration     `json:"apple"`
+	Azure                   OAuthProviderConfiguration     `json:"azure"`
+	Bitbucket               OAuthProviderConfiguration     `json:"bitbucket"`
+	Discord                 OAuthProviderConfiguration     `json:"discord"`
+	Facebook                OAuthProviderConfiguration     `json:"facebook"`
+	Figma                   OAuthProviderConfiguration     `json:"figma"`
+	Fly                     OAuthProviderConfiguration     `json:"fly"`
+	Github                  OAuthProviderConfiguration     `json:"github"`
+	Gitlab                  OAuthProviderConfiguration     `json:"gitlab"`
+	Google                  OAuthProviderConfiguration     `json:"google"`
+	Kakao                   OAuthProviderConfiguration     `json:"kakao"`
+	Notion                  OAuthProviderConfiguration     `json:"notion"`
+	Keycloak                OAuthProviderConfiguration     `json:"keycloak"`
+	Linkedin                OAuthProviderConfiguration     `json:"linkedin"`
+	LinkedinOIDC            OAuthProviderConfiguration     `json:"linkedin_oidc" envconfig:"LINKEDIN_OIDC"`
+	Spotify                 OAuthProviderConfiguration     `json:"spotify"`
+	Slack                   OAuthProviderConfiguration     `json:"slack"`
+	Twitter                 OAuthProviderConfiguration     `json:"twitter"`
+	Twitch                  OAuthProviderConfiguration     `json:"twitch"`
+	WorkOS                  OAuthProviderConfiguration     `json:"workos"`
+	Email                   EmailProviderConfiguration     `json:"email"`
+	Phone                   PhoneProviderConfiguration     `json:"phone"`
+	Zoom                    OAuthProviderConfiguration     `json:"zoom"`
+	IosBundleId             string                         `json:"ios_bundle_id" split_words:"true"`
+	RedirectURL             string                         `json:"redirect_url"`
+	AllowedIdTokenIssuers   []string                       `json:"allowed_id_token_issuers" split_words:"true"`
+	FlowStateExpiryDuration time.Duration                  `json:"flow_state_expiry_duration" split_words:"true"`
 }
 
 type SMTPConfiguration struct {
@@ -227,13 +324,17 @@ func (c *SMTPConfiguration) Validate() error {
 }
 
 type MailerConfiguration struct {
-	Autoconfirm              bool                      `json:"autoconfirm"`
-	Subjects                 EmailContentConfiguration `json:"subjects"`
-	Templates                EmailContentConfiguration `json:"templates"`
-	URLPaths                 EmailContentConfiguration `json:"url_paths"`
-	SecureEmailChangeEnabled bool                      `json:"secure_email_change_enabled" split_words:"true" default:"true"`
-	OtpExp                   uint                      `json:"otp_exp" split_words:"true"`
-	OtpLength                int                       `json:"otp_length" split_words:"true"`
+	Autoconfirm                 bool `json:"autoconfirm"`
+	AllowUnverifiedEmailSignIns bool `json:"allow_unverified_email_sign_ins" split_words:"true" default:"false"`
+
+	Subjects  EmailContentConfiguration `json:"subjects"`
+	Templates EmailContentConfiguration `json:"templates"`
+	URLPaths  EmailContentConfiguration `json:"url_paths"`
+
+	SecureEmailChangeEnabled bool `json:"secure_email_change_enabled" split_words:"true" default:"true"`
+
+	OtpExp    uint `json:"otp_exp" split_words:"true"`
+	OtpLength int  `json:"otp_length" split_words:"true"`
 }
 
 type PhoneProviderConfiguration struct {
@@ -271,6 +372,7 @@ type TwilioProviderConfiguration struct {
 	AccountSid        string `json:"account_sid" split_words:"true"`
 	AuthToken         string `json:"auth_token" split_words:"true"`
 	MessageServiceSid string `json:"message_service_sid" split_words:"true"`
+	ContentSid        string `json:"content_sid" split_words:"true"`
 }
 
 type TwilioVerifyProviderConfiguration struct {
@@ -324,6 +426,7 @@ type SecurityConfiguration struct {
 	RefreshTokenRotationEnabled           bool                 `json:"refresh_token_rotation_enabled" split_words:"true" default:"true"`
 	RefreshTokenReuseInterval             int                  `json:"refresh_token_reuse_interval" split_words:"true"`
 	UpdatePasswordRequireReauthentication bool                 `json:"update_password_require_reauthentication" split_words:"true"`
+	ManualLinkingEnabled                  bool                 `json:"manual_linking_enabled" split_words:"true" default:"false"`
 }
 
 func (c *SecurityConfiguration) Validate() error {
@@ -344,21 +447,117 @@ func loadEnvironment(filename string) error {
 	return err
 }
 
-type WebhookConfig struct {
-	URL        string   `json:"url"`
-	Retries    int      `json:"retries"`
-	TimeoutSec int      `json:"timeout_sec"`
-	Secret     string   `json:"secret"`
-	Events     []string `json:"events"`
+// Moving away from the existing HookConfig so we can get a fresh start.
+type HookConfiguration struct {
+	MFAVerificationAttempt      ExtensibilityPointConfiguration `json:"mfa_verification_attempt" split_words:"true"`
+	PasswordVerificationAttempt ExtensibilityPointConfiguration `json:"password_verification_attempt" split_words:"true"`
+	CustomAccessToken           ExtensibilityPointConfiguration `json:"custom_access_token" split_words:"true"`
+	SendEmail                   ExtensibilityPointConfiguration `json:"send_email" split_words:"true"`
+	SendSMS                     ExtensibilityPointConfiguration `json:"send_sms" split_words:"true"`
 }
 
-func (w *WebhookConfig) HasEvent(event string) bool {
-	for _, name := range w.Events {
-		if event == name {
-			return true
+type HTTPHookSecrets []string
+
+func (h *HTTPHookSecrets) Decode(value string) error {
+	parts := strings.Split(value, "|")
+	for _, part := range parts {
+		if part != "" {
+			*h = append(*h, part)
 		}
 	}
-	return false
+
+	return nil
+}
+
+type ExtensibilityPointConfiguration struct {
+	URI      string `json:"uri"`
+	Enabled  bool   `json:"enabled"`
+	HookName string `json:"hook_name"`
+	// We use | as a separator for keys and : as a separator for keys within a keypair. For instance: v1,whsec_test|v1a,whpk_myother:v1a,whsk_testkey|v1,whsec_secret3
+	HTTPHookSecrets HTTPHookSecrets `json:"secrets" envconfig:"secrets"`
+}
+
+func (h *HookConfiguration) Validate() error {
+	points := []ExtensibilityPointConfiguration{
+		h.MFAVerificationAttempt,
+		h.PasswordVerificationAttempt,
+		h.CustomAccessToken,
+		h.SendSMS,
+		h.SendEmail,
+	}
+	for _, point := range points {
+		if err := point.ValidateExtensibilityPoint(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *ExtensibilityPointConfiguration) ValidateExtensibilityPoint() error {
+	if e.URI == "" {
+		return nil
+	}
+	u, err := url.Parse(e.URI)
+	if err != nil {
+		return err
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "pg-functions":
+		return validatePostgresPath(u)
+	case "http":
+		hostname := u.Hostname()
+		if hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1" || hostname == "host.docker.internal" {
+			return validateHTTPHookSecrets(e.HTTPHookSecrets)
+		}
+		return fmt.Errorf("only localhost, 127.0.0.1, and ::1 are supported with http")
+	case "https":
+		return validateHTTPHookSecrets(e.HTTPHookSecrets)
+	default:
+		return fmt.Errorf("only postgres hooks and HTTPS functions are supported at the moment")
+	}
+}
+
+func validatePostgresPath(u *url.URL) error {
+	pathParts := strings.Split(u.Path, "/")
+	if len(pathParts) < 3 {
+		return fmt.Errorf("URI path does not contain enough parts")
+	}
+
+	schema := pathParts[1]
+	table := pathParts[2]
+	// Validate schema and table names
+	if !postgresNamesRegexp.MatchString(schema) {
+		return fmt.Errorf("invalid schema name: %s", schema)
+	}
+	if !postgresNamesRegexp.MatchString(table) {
+		return fmt.Errorf("invalid table name: %s", table)
+	}
+	return nil
+}
+
+func isValidSecretFormat(secret string) bool {
+	return symmetricSecretFormat.MatchString(secret) || asymmetricSecretFormat.MatchString(secret)
+}
+
+func validateHTTPHookSecrets(secrets []string) error {
+	for _, secret := range secrets {
+		if !isValidSecretFormat(secret) {
+			return fmt.Errorf("invalid secret format")
+		}
+	}
+	return nil
+}
+
+func (e *ExtensibilityPointConfiguration) PopulateExtensibilityPoint() error {
+	u, err := url.Parse(e.URI)
+	if err != nil {
+		return err
+	}
+	if u.Scheme == "pg-functions" {
+		pathParts := strings.Split(u.Path, "/")
+		e.HookName = fmt.Sprintf("%q.%q", pathParts[1], pathParts[2])
+	}
+	return nil
 }
 
 func LoadGlobal(filename string) (*GlobalConfiguration, error) {
@@ -367,6 +566,9 @@ func LoadGlobal(filename string) (*GlobalConfiguration, error) {
 	}
 
 	config := new(GlobalConfiguration)
+
+	// although the package is called "auth" it used to be called "gotrue"
+	// so environment configs will remain to be called "GOTRUE"
 	if err := envconfig.Process("gotrue", config); err != nil {
 		return nil, err
 	}
@@ -379,6 +581,35 @@ func LoadGlobal(filename string) (*GlobalConfiguration, error) {
 		return nil, err
 	}
 
+	if config.Hook.PasswordVerificationAttempt.Enabled {
+		if err := config.Hook.PasswordVerificationAttempt.PopulateExtensibilityPoint(); err != nil {
+			return nil, err
+		}
+	}
+
+	if config.Hook.SendSMS.Enabled {
+		if err := config.Hook.SendSMS.PopulateExtensibilityPoint(); err != nil {
+			return nil, err
+		}
+	}
+	if config.Hook.SendEmail.Enabled {
+		if err := config.Hook.SendEmail.PopulateExtensibilityPoint(); err != nil {
+			return nil, err
+		}
+	}
+
+	if config.Hook.MFAVerificationAttempt.Enabled {
+		if err := config.Hook.MFAVerificationAttempt.PopulateExtensibilityPoint(); err != nil {
+			return nil, err
+		}
+	}
+
+	if config.Hook.CustomAccessToken.Enabled {
+		if err := config.Hook.CustomAccessToken.PopulateExtensibilityPoint(); err != nil {
+			return nil, err
+		}
+	}
+
 	if config.SAML.Enabled {
 		if err := config.SAML.PopulateFields(config.API.ExternalURL); err != nil {
 			return nil, err
@@ -386,6 +617,7 @@ func LoadGlobal(filename string) (*GlobalConfiguration, error) {
 	} else {
 		config.SAML.PrivateKey = ""
 	}
+
 	if config.Sms.Provider != "" {
 		SMSTemplate := config.Sms.Template
 		if SMSTemplate == "" {
@@ -397,7 +629,6 @@ func LoadGlobal(filename string) (*GlobalConfiguration, error) {
 		}
 		config.Sms.SMSTemplate = template
 	}
-
 	return config, nil
 }
 
@@ -413,6 +644,10 @@ func (config *GlobalConfiguration) ApplyDefaults() error {
 
 	if config.JWT.Exp == 0 {
 		config.JWT.Exp = 3600
+	}
+
+	if config.Mailer.Autoconfirm && config.Mailer.AllowUnverifiedEmailSignIns {
+		return errors.New("cannot enable both GOTRUE_MAILER_AUTOCONFIRM and GOTRUE_MAILER_ALLOW_UNVERIFIED_EMAIL_SIGN_INS")
 	}
 
 	if config.Mailer.URLPaths.Invite == "" {
@@ -485,11 +720,14 @@ func (config *GlobalConfiguration) ApplyDefaults() error {
 		}
 	}
 
-	if config.PasswordMinLength < defaultMinPasswordLength {
-		config.PasswordMinLength = defaultMinPasswordLength
+	if config.Password.MinLength < defaultMinPasswordLength {
+		config.Password.MinLength = defaultMinPasswordLength
 	}
 	if config.MFA.ChallengeExpiryDuration < defaultChallengeExpiryDuration {
 		config.MFA.ChallengeExpiryDuration = defaultChallengeExpiryDuration
+	}
+	if config.MFA.FactorExpiryDuration < defaultFactorExpiryDuration {
+		config.MFA.FactorExpiryDuration = defaultFactorExpiryDuration
 	}
 	if config.External.FlowStateExpiryDuration < defaultFlowStateExpiryDuration {
 		config.External.FlowStateExpiryDuration = defaultFlowStateExpiryDuration
@@ -514,6 +752,8 @@ func (c *GlobalConfiguration) Validate() error {
 		&c.SMTP,
 		&c.SAML,
 		&c.Security,
+		&c.Sessions,
+		&c.Hook,
 	}
 
 	for _, validatable := range validatables {

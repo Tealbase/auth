@@ -2,7 +2,7 @@
 package docs
 
 import (
-	"github.com/tealbase/gotrue/internal/api"
+	"github.com/tealbase/auth/internal/api"
 )
 
 // swagger:route GET /admin/users admin admin-list-users

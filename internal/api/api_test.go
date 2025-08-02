@@ -5,10 +5,10 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/crypto"
-	"github.com/tealbase/gotrue/internal/storage"
-	"github.com/tealbase/gotrue/internal/storage/test"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/crypto"
+	"github.com/tealbase/auth/internal/storage"
+	"github.com/tealbase/auth/internal/storage/test"
 )
 
 const (

@@ -7,8 +7,8 @@ import (
 
 	chimiddleware "github.com/go-chi/chi/middleware"
 	"github.com/sirupsen/logrus"
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/utilities"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/utilities"
 )
 
 func NewStructuredLogger(logger *logrus.Logger, config *conf.GlobalConfiguration) func(next http.Handler) http.Handler {

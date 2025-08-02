@@ -9,8 +9,8 @@ import (
 	jwt "github.com/golang-jwt/jwt"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/models"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/models"
 )
 
 type AuthTestSuite struct {
@@ -41,7 +41,7 @@ func (ts *AuthTestSuite) SetupTest() {
 }
 
 func (ts *AuthTestSuite) TestExtractBearerToken() {
-	userClaims := &GoTrueClaims{
+	userClaims := &AccessTokenClaims{
 		Role: "authenticated",
 	}
 	userJwt, err := jwt.NewWithClaims(jwt.SigningMethodHS256, userClaims).SignedString([]byte(ts.Config.JWT.Secret))
@@ -55,7 +55,7 @@ func (ts *AuthTestSuite) TestExtractBearerToken() {
 }
 
 func (ts *AuthTestSuite) TestParseJWTClaims() {
-	userClaims := &GoTrueClaims{
+	userClaims := &AccessTokenClaims{
 		Role: "authenticated",
 	}
 	userJwt, err := jwt.NewWithClaims(jwt.SigningMethodHS256, userClaims).SignedString([]byte(ts.Config.JWT.Secret))
@@ -75,34 +75,33 @@ func (ts *AuthTestSuite) TestMaybeLoadUserOrSession() {
 	u, err := models.FindUserByEmailAndAudience(ts.API.db, "test@example.com", ts.Config.JWT.Aud)
 	require.NoError(ts.T(), err)
 
-	s, err := models.NewSession()
+	s, err := models.NewSession(u.ID, nil)
 	require.NoError(ts.T(), err)
-	s.UserID = u.ID
 	require.NoError(ts.T(), ts.API.db.Create(s))
 
 	require.NoError(ts.T(), ts.API.db.Load(s))
 
 	cases := []struct {
 		Desc            string
-		UserJwtClaims   *GoTrueClaims
+		UserJwtClaims   *AccessTokenClaims
 		ExpectedError   error
 		ExpectedUser    *models.User
 		ExpectedSession *models.Session
 	}{
 		{
 			Desc: "Missing Subject Claim",
-			UserJwtClaims: &GoTrueClaims{
+			UserJwtClaims: &AccessTokenClaims{
 				StandardClaims: jwt.StandardClaims{
 					Subject: "",
 				},
 				Role: "authenticated",
 			},
-			ExpectedError: unauthorizedError("invalid claim: missing sub claim"),
+			ExpectedError: forbiddenError(ErrorCodeBadJWT, "invalid claim: missing sub claim"),
 			ExpectedUser:  nil,
 		},
 		{
 			Desc: "Valid Subject Claim",
-			UserJwtClaims: &GoTrueClaims{
+			UserJwtClaims: &AccessTokenClaims{
 				StandardClaims: jwt.StandardClaims{
 					Subject: u.ID.String(),
 				},
@@ -113,18 +112,18 @@ func (ts *AuthTestSuite) TestMaybeLoadUserOrSession() {
 		},
 		{
 			Desc: "Invalid Subject Claim",
-			UserJwtClaims: &GoTrueClaims{
+			UserJwtClaims: &AccessTokenClaims{
 				StandardClaims: jwt.StandardClaims{
 					Subject: "invalid-subject-claim",
 				},
 				Role: "authenticated",
 			},
-			ExpectedError: badRequestError("invalid claim: sub claim must be a UUID"),
+			ExpectedError: badRequestError(ErrorCodeBadJWT, "invalid claim: sub claim must be a UUID"),
 			ExpectedUser:  nil,
 		},
 		{
 			Desc: "Empty Session ID Claim",
-			UserJwtClaims: &GoTrueClaims{
+			UserJwtClaims: &AccessTokenClaims{
 				StandardClaims: jwt.StandardClaims{
 					Subject: u.ID.String(),
 				},
@@ -136,7 +135,7 @@ func (ts *AuthTestSuite) TestMaybeLoadUserOrSession() {
 		},
 		{
 			Desc: "Invalid Session ID Claim",
-			UserJwtClaims: &GoTrueClaims{
+			UserJwtClaims: &AccessTokenClaims{
 				StandardClaims: jwt.StandardClaims{
 					Subject: u.ID.String(),
 				},
@@ -148,7 +147,7 @@ func (ts *AuthTestSuite) TestMaybeLoadUserOrSession() {
 		},
 		{
 			Desc: "Valid Session ID Claim",
-			UserJwtClaims: &GoTrueClaims{
+			UserJwtClaims: &AccessTokenClaims{
 				StandardClaims: jwt.StandardClaims{
 					Subject: u.ID.String(),
 				},
@@ -158,6 +157,19 @@ func (ts *AuthTestSuite) TestMaybeLoadUserOrSession() {
 			ExpectedError:   nil,
 			ExpectedUser:    u,
 			ExpectedSession: s,
+		},
+		{
+			Desc: "Session ID doesn't exist",
+			UserJwtClaims: &AccessTokenClaims{
+				StandardClaims: jwt.StandardClaims{
+					Subject: u.ID.String(),
+				},
+				Role:      "authenticated",
+				SessionId: "73bf9ee0-9e8c-453b-b484-09cb93e2f341",
+			},
+			ExpectedError:   forbiddenError(ErrorCodeSessionNotFound, "Session from session_id claim in JWT does not exist"),
+			ExpectedUser:    u,
+			ExpectedSession: nil,
 		},
 	}
 

@@ -7,8 +7,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/utilities"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/utilities"
 )
 
 const (
@@ -53,7 +53,7 @@ func NewTwilioVerifyProvider(config conf.TwilioVerifyProviderConfiguration) (Sms
 	}, nil
 }
 
-func (t *TwilioVerifyProvider) SendMessage(phone string, message string, channel string) (string, error) {
+func (t *TwilioVerifyProvider) SendMessage(phone, message, channel, otp string) (string, error) {
 	switch channel {
 	case SMSProvider, WhatsappProvider:
 		return t.SendSms(phone, message, channel)
@@ -78,10 +78,10 @@ func (t *TwilioVerifyProvider) SendSms(phone, message, channel string) (string, 
 	r.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	r.SetBasicAuth(t.Config.AccountSid, t.Config.AuthToken)
 	res, err := client.Do(r)
-	defer utilities.SafeClose(res.Body)
 	if err != nil {
 		return "", err
 	}
+	defer utilities.SafeClose(res.Body)
 	if !(res.StatusCode == http.StatusOK || res.StatusCode == http.StatusCreated) {
 		resp := &twilioErrResponse{}
 		if err := json.NewDecoder(res.Body).Decode(resp); err != nil {
@@ -114,10 +114,10 @@ func (t *TwilioVerifyProvider) VerifyOTP(phone, code string) error {
 	r.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	r.SetBasicAuth(t.Config.AccountSid, t.Config.AuthToken)
 	res, err := client.Do(r)
-	defer utilities.SafeClose(res.Body)
 	if err != nil {
 		return err
 	}
+	defer utilities.SafeClose(res.Body)
 	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
 		resp := &twilioErrResponse{}
 		if err := json.NewDecoder(res.Body).Decode(resp); err != nil {

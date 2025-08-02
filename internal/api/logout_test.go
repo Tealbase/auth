@@ -9,8 +9,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/models"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/models"
 )
 
 type LogoutTestSuite struct {
@@ -42,7 +42,12 @@ func (ts *LogoutTestSuite) SetupTest() {
 
 	// generate access token to use for logout
 	var t string
-	t, _, err = generateAccessToken(ts.API.db, u, nil, &ts.Config.JWT)
+	s, err := models.NewSession(u.ID, nil)
+	require.NoError(ts.T(), err)
+	require.NoError(ts.T(), ts.API.db.Create(s))
+
+	req := httptest.NewRequest(http.MethodPost, "/token?grant_type=password", nil)
+	t, _, err = ts.API.generateAccessToken(req, ts.API.db, u, &s.ID, models.PasswordGrant)
 	require.NoError(ts.T(), err)
 	ts.token = t
 }

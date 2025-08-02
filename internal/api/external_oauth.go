@@ -2,14 +2,14 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 
 	"github.com/mrjones/oauth"
 	"github.com/sirupsen/logrus"
-	"github.com/tealbase/gotrue/internal/api/provider"
-	"github.com/tealbase/gotrue/internal/observability"
-	"github.com/tealbase/gotrue/internal/storage"
+	"github.com/tealbase/auth/internal/api/provider"
+	"github.com/tealbase/auth/internal/observability"
 )
 
 // OAuthProviderData contains the userData and token returned by the oauth provider
@@ -31,7 +31,7 @@ func (a *API) loadFlowState(w http.ResponseWriter, r *http.Request) (context.Con
 	}
 
 	if state == "" {
-		return nil, badRequestError("OAuth state parameter missing")
+		return nil, badRequestError(ErrorCodeBadOAuthCallback, "OAuth state parameter missing")
 	}
 
 	ctx := r.Context()
@@ -61,12 +61,12 @@ func (a *API) oAuthCallback(ctx context.Context, r *http.Request, providerType s
 
 	oauthCode := rq.Get("code")
 	if oauthCode == "" {
-		return nil, badRequestError("Authorization code missing")
+		return nil, badRequestError(ErrorCodeBadOAuthCallback, "OAuth callback with missing authorization code missing")
 	}
 
 	oAuthProvider, err := a.OAuthProvider(ctx, providerType)
 	if err != nil {
-		return nil, badRequestError("Unsupported provider: %+v", err).WithInternalError(err)
+		return nil, badRequestError(ErrorCodeOAuthProviderNotSupported, "Unsupported provider: %+v", err).WithInternalError(err)
 	}
 
 	log := observability.GetLogEntry(r)
@@ -82,7 +82,7 @@ func (a *API) oAuthCallback(ctx context.Context, r *http.Request, providerType s
 
 	userData, err := oAuthProvider.GetUserData(ctx, token)
 	if err != nil {
-		return nil, internalServerError("Error getting user email from external provider").WithInternalError(err)
+		return nil, internalServerError("Error getting user profile from external provider").WithInternalError(err)
 	}
 
 	switch externalProvider := oAuthProvider.(type) {
@@ -105,29 +105,19 @@ func (a *API) oAuthCallback(ctx context.Context, r *http.Request, providerType s
 	}, nil
 }
 
-func (a *API) oAuth1Callback(ctx context.Context, r *http.Request, providerType string) (*OAuthProviderData, error) {
+func (a *API) oAuth1Callback(ctx context.Context, providerType string) (*OAuthProviderData, error) {
 	oAuthProvider, err := a.OAuthProvider(ctx, providerType)
 	if err != nil {
-		return nil, badRequestError("Unsupported provider: %+v", err).WithInternalError(err)
-	}
-	value, err := storage.GetFromSession(providerType, r)
-	if err != nil {
-		return &OAuthProviderData{}, err
+		return nil, badRequestError(ErrorCodeOAuthProviderNotSupported, "Unsupported provider: %+v", err).WithInternalError(err)
 	}
 	oauthToken := getRequestToken(ctx)
 	oauthVerifier := getOAuthVerifier(ctx)
 	var accessToken *oauth.AccessToken
 	var userData *provider.UserProvidedData
 	if twitterProvider, ok := oAuthProvider.(*provider.TwitterProvider); ok {
-		requestToken, err := twitterProvider.Unmarshal(value)
-		if err != nil {
-			return &OAuthProviderData{}, err
-		}
-		if requestToken.Token != oauthToken {
-			return nil, internalServerError("Request token doesn't match token in callback")
-		}
-		twitterProvider.OauthVerifier = oauthVerifier
-		accessToken, err = twitterProvider.Consumer.AuthorizeToken(requestToken, oauthVerifier)
+		accessToken, err = twitterProvider.Consumer.AuthorizeToken(&oauth.RequestToken{
+			Token: oauthToken,
+		}, oauthVerifier)
 		if err != nil {
 			return nil, internalServerError("Unable to retrieve access token").WithInternalError(err)
 		}
@@ -156,6 +146,6 @@ func (a *API) OAuthProvider(ctx context.Context, name string) (provider.OAuthPro
 	case provider.OAuthProvider:
 		return p, nil
 	default:
-		return nil, badRequestError("Provider can not be used for OAuth")
+		return nil, fmt.Errorf("Provider %v cannot be used for OAuth", name)
 	}
 }

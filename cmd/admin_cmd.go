@@ -4,9 +4,9 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/models"
-	"github.com/tealbase/gotrue/internal/storage"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/models"
+	"github.com/tealbase/auth/internal/storage"
 )
 
 var autoconfirm, isAdmin bool

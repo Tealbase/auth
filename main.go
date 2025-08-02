@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"github.com/tealbase/gotrue/cmd"
-	"github.com/tealbase/gotrue/internal/api"
-	"github.com/tealbase/gotrue/internal/observability"
+	"github.com/tealbase/auth/cmd"
+	"github.com/tealbase/auth/internal/api"
+	"github.com/tealbase/auth/internal/observability"
 )
 
 func init() {

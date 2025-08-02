@@ -13,9 +13,9 @@ import (
 	"github.com/golang-jwt/jwt"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/crypto"
-	"github.com/tealbase/gotrue/internal/models"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/crypto"
+	"github.com/tealbase/auth/internal/models"
 )
 
 type MailTestSuite struct {
@@ -50,7 +50,7 @@ func (ts *MailTestSuite) SetupTest() {
 
 func (ts *MailTestSuite) TestGenerateLink() {
 	// create admin jwt
-	claims := &GoTrueClaims{
+	claims := &AccessTokenClaims{
 		Role: "tealbase_admin",
 	}
 	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(ts.Config.JWT.Secret))
@@ -65,7 +65,19 @@ func (ts *MailTestSuite) TestGenerateLink() {
 		ExpectedResponse map[string]interface{}
 	}{
 		{
-			Desc: "Generate signup link",
+			Desc: "Generate signup link for new user",
+			Body: GenerateLinkParams{
+				Email:    "new_user@example.com",
+				Password: "secret123",
+				Type:     "signup",
+			},
+			ExpectedCode: http.StatusOK,
+			ExpectedResponse: map[string]interface{}{
+				"redirect_to": ts.Config.SiteURL,
+			},
+		},
+		{
+			Desc: "Generate signup link for existing user",
 			Body: GenerateLinkParams{
 				Email:    "test@example.com",
 				Password: "secret123",

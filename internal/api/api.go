@@ -12,10 +12,13 @@ import (
 	"github.com/rs/cors"
 	"github.com/sebest/xff"
 	"github.com/sirupsen/logrus"
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/mailer"
-	"github.com/tealbase/gotrue/internal/observability"
-	"github.com/tealbase/gotrue/internal/storage"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/mailer"
+	"github.com/tealbase/auth/internal/models"
+	"github.com/tealbase/auth/internal/observability"
+	"github.com/tealbase/auth/internal/storage"
+	"github.com/tealbase/auth/internal/utilities"
+	"github.com/tealbase/hibp"
 )
 
 const (
@@ -31,6 +34,19 @@ type API struct {
 	db      *storage.Connection
 	config  *conf.GlobalConfiguration
 	version string
+
+	hibpClient *hibp.PwnedClient
+
+	// overrideTime can be used to override the clock used by handlers. Should only be used in tests!
+	overrideTime func() time.Time
+}
+
+func (a *API) Now() time.Time {
+	if a.overrideTime != nil {
+		return a.overrideTime()
+	}
+
+	return time.Now()
 }
 
 // NewAPI instantiates a new REST API
@@ -38,7 +54,7 @@ func NewAPI(globalConfig *conf.GlobalConfiguration, db *storage.Connection) *API
 	return NewAPIWithVersion(context.Background(), globalConfig, db, defaultVersion)
 }
 
-func (a *API) deprecationNotices(ctx context.Context) {
+func (a *API) deprecationNotices() {
 	config := a.config
 
 	log := logrus.WithField("component", "api")
@@ -56,25 +72,41 @@ func (a *API) deprecationNotices(ctx context.Context) {
 func NewAPIWithVersion(ctx context.Context, globalConfig *conf.GlobalConfiguration, db *storage.Connection, version string) *API {
 	api := &API{config: globalConfig, db: db, version: version}
 
-	api.deprecationNotices(ctx)
+	if api.config.Password.HIBP.Enabled {
+		httpClient := &http.Client{
+			// all HIBP API requests should finish quickly to avoid
+			// unnecessary slowdowns
+			Timeout: 5 * time.Second,
+		}
+
+		api.hibpClient = &hibp.PwnedClient{
+			UserAgent: api.config.Password.HIBP.UserAgent,
+			HTTP:      httpClient,
+		}
+
+		if api.config.Password.HIBP.Bloom.Enabled {
+			cache := utilities.NewHIBPBloomCache(api.config.Password.HIBP.Bloom.Items, api.config.Password.HIBP.Bloom.FalsePositives)
+			api.hibpClient.Cache = cache
+
+			logrus.Infof("Pwned passwords cache is %.2f KB", float64(cache.Cap())/(8*1024.0))
+		}
+	}
+
+	api.deprecationNotices()
 
 	xffmw, _ := xff.Default()
 	logger := observability.NewStructuredLogger(logrus.StandardLogger(), globalConfig)
 
 	r := newRouter()
+
+	if globalConfig.API.MaxRequestDuration > 0 {
+		r.UseBypass(api.timeoutMiddleware(globalConfig.API.MaxRequestDuration))
+	}
+
 	r.Use(addRequestID(globalConfig))
 
-	// request tracing should be added only when tracing or metrics is
-	// enabled
-	if globalConfig.Tracing.Enabled {
-		switch globalConfig.Tracing.Exporter {
-		case conf.OpenTracing:
-			r.UseBypass(opentracer)
-
-		default:
-			r.UseBypass(observability.RequestTracing())
-		}
-	} else if globalConfig.Metrics.Enabled {
+	// request tracing should be added only when tracing or metrics is enabled
+	if globalConfig.Tracing.Enabled || globalConfig.Metrics.Enabled {
 		r.UseBypass(observability.RequestTracing())
 	}
 
@@ -82,7 +114,8 @@ func NewAPIWithVersion(ctx context.Context, globalConfig *conf.GlobalConfigurati
 	r.Use(recoverer)
 
 	if globalConfig.DB.CleanupEnabled {
-		r.UseBypass(api.databaseCleanup)
+		cleanup := models.NewCleanup(globalConfig)
+		r.UseBypass(api.databaseCleanup(cleanup))
 	}
 
 	r.Get("/health", api.HealthCheck)
@@ -106,7 +139,28 @@ func NewAPIWithVersion(ctx context.Context, globalConfig *conf.GlobalConfigurati
 
 		sharedLimiter := api.limitEmailOrPhoneSentHandler()
 		r.With(sharedLimiter).With(api.requireAdminCredentials).Post("/invite", api.Invite)
-		r.With(sharedLimiter).With(api.verifyCaptcha).Post("/signup", api.Signup)
+		r.With(sharedLimiter).With(api.verifyCaptcha).Route("/signup", func(r *router) {
+			// rate limit per hour
+			limiter := tollbooth.NewLimiter(api.config.RateLimitAnonymousUsers/(60*60), &limiter.ExpirableOptions{
+				DefaultExpirationTTL: time.Hour,
+			}).SetBurst(int(api.config.RateLimitAnonymousUsers)).SetMethods([]string{"POST"})
+			r.Post("/", func(w http.ResponseWriter, r *http.Request) error {
+				params := &SignupParams{}
+				if err := retrieveRequestParams(r, params); err != nil {
+					return err
+				}
+				if params.Email == "" && params.Phone == "" {
+					if !api.config.External.AnonymousUsers.Enabled {
+						return unprocessableEntityError(ErrorCodeAnonymousProviderDisabled, "Anonymous sign-ins are disabled")
+					}
+					if _, err := api.limitHandler(limiter)(w, r); err != nil {
+						return err
+					}
+					return api.SignupAnonymously(w, r)
+				}
+				return api.Signup(w, r)
+			})
+		})
 		r.With(sharedLimiter).With(api.verifyCaptcha).With(api.requireEmailProvider).Post("/recover", api.Recover)
 		r.With(sharedLimiter).With(api.verifyCaptcha).Post("/resend", api.Resend)
 		r.With(sharedLimiter).With(api.verifyCaptcha).Post("/magiclink", api.MagicLink)
@@ -139,9 +193,16 @@ func NewAPIWithVersion(ctx context.Context, globalConfig *conf.GlobalConfigurati
 		r.With(api.requireAuthentication).Route("/user", func(r *router) {
 			r.Get("/", api.UserGet)
 			r.With(sharedLimiter).Put("/", api.UserUpdate)
+
+			r.Route("/identities", func(r *router) {
+				r.Use(api.requireManualLinkingEnabled)
+				r.Get("/authorize", api.LinkIdentity)
+				r.Delete("/{identity_id}", api.DeleteIdentity)
+			})
 		})
 
 		r.With(api.requireAuthentication).Route("/factors", func(r *router) {
+			r.Use(api.requireNotAnonymous)
 			r.Post("/", api.EnrollFactor)
 			r.Route("/{factor_id}", func(r *router) {
 				r.Use(api.loadFactor)
@@ -208,7 +269,7 @@ func NewAPIWithVersion(ctx context.Context, globalConfig *conf.GlobalConfigurati
 				})
 			})
 
-			r.Post("/generate_link", api.GenerateLink)
+			r.Post("/generate_link", api.adminGenerateLink)
 
 			r.Route("/sso", func(r *router) {
 				r.Route("/providers", func(r *router) {
@@ -255,7 +316,7 @@ func (a *API) HealthCheck(w http.ResponseWriter, r *http.Request) error {
 }
 
 // Mailer returns NewMailer with the current tenant config
-func (a *API) Mailer(ctx context.Context) mailer.Mailer {
+func (a *API) Mailer() mailer.Mailer {
 	config := a.config
 	return mailer.NewMailer(config)
 }

@@ -1,6 +1,6 @@
 # Security Policy
 
-GoTrue is a project maintained by [tealbase](https://tealbase.com). Below is
+Auth is a project maintained by [tealbase](https://tealbase.com). Below is
 our security policy.
 
 Contact: security@tealbase.io 

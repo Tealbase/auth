@@ -5,13 +5,14 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/tealbase/gotrue/internal/conf"
+	"github.com/tealbase/auth/internal/conf"
 	"golang.org/x/oauth2"
 )
 
 const (
 	defaultKakaoAuthBase = "kauth.kakao.com"
 	defaultKakaoAPIBase  = "kapi.kakao.com"
+	IssuerKakao          = "https://kauth.kakao.com"
 )
 
 type kakaoProvider struct {
@@ -43,29 +44,30 @@ func (p kakaoProvider) GetUserData(ctx context.Context, tok *oauth2.Token) (*Use
 		return nil, err
 	}
 
-	data := &UserProvidedData{
-		Emails: []Email{
+	data := &UserProvidedData{}
+
+	if u.Account.Email != "" {
+		data.Emails = []Email{
 			{
 				Email:    u.Account.Email,
 				Verified: u.Account.EmailVerified && u.Account.EmailValid,
 				Primary:  true,
 			},
-		},
-		Metadata: &Claims{
-			Issuer:        p.APIHost,
-			Subject:       strconv.Itoa(u.ID),
-			Email:         u.Account.Email,
-			EmailVerified: u.Account.EmailVerified && u.Account.EmailValid,
+		}
+	}
 
-			Name:              u.Account.Profile.Name,
-			PreferredUsername: u.Account.Profile.Name,
+	data.Metadata = &Claims{
+		Issuer:  p.APIHost,
+		Subject: strconv.Itoa(u.ID),
 
-			// To be deprecated
-			AvatarURL:   u.Account.Profile.ProfileImageURL,
-			FullName:    u.Account.Profile.Name,
-			ProviderId:  strconv.Itoa(u.ID),
-			UserNameKey: u.Account.Profile.Name,
-		},
+		Name:              u.Account.Profile.Name,
+		PreferredUsername: u.Account.Profile.Name,
+
+		// To be deprecated
+		AvatarURL:   u.Account.Profile.ProfileImageURL,
+		FullName:    u.Account.Profile.Name,
+		ProviderId:  strconv.Itoa(u.ID),
+		UserNameKey: u.Account.Profile.Name,
 	}
 	return data, nil
 }

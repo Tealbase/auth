@@ -5,8 +5,8 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/observability"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/observability"
 )
 
 var configFile = ""

@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,9 +13,9 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"github.com/tealbase/gotrue/internal/conf"
-	"github.com/tealbase/gotrue/internal/crypto"
-	"github.com/tealbase/gotrue/internal/models"
+	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/crypto"
+	"github.com/tealbase/auth/internal/models"
 )
 
 type UserTestSuite struct {
@@ -45,11 +46,28 @@ func (ts *UserTestSuite) SetupTest() {
 	require.NoError(ts.T(), ts.API.db.Create(u), "Error saving new test user")
 }
 
+func (ts *UserTestSuite) generateToken(user *models.User, sessionId *uuid.UUID) string {
+	req := httptest.NewRequest(http.MethodPost, "/token?grant_type=password", nil)
+	token, _, err := ts.API.generateAccessToken(req, ts.API.db, user, sessionId, models.PasswordGrant)
+	require.NoError(ts.T(), err, "Error generating access token")
+	return token
+}
+
+func (ts *UserTestSuite) generateAccessTokenAndSession(user *models.User) string {
+	session, err := models.NewSession(user.ID, nil)
+	require.NoError(ts.T(), err)
+	require.NoError(ts.T(), ts.API.db.Create(session))
+
+	req := httptest.NewRequest(http.MethodPost, "/token?grant_type=password", nil)
+	token, _, err := ts.API.generateAccessToken(req, ts.API.db, user, &session.ID, models.PasswordGrant)
+	require.NoError(ts.T(), err, "Error generating access token")
+	return token
+}
+
 func (ts *UserTestSuite) TestUserGet() {
 	u, err := models.FindUserByEmailAndAudience(ts.API.db, "test@example.com", ts.Config.JWT.Aud)
 	require.NoError(ts.T(), err, "Error finding user")
-	var token string
-	token, _, err = generateAccessToken(ts.API.db, u, nil, &ts.Config.JWT)
+	token := ts.generateAccessTokenAndSession(u)
 
 	require.NoError(ts.T(), err, "Error generating access token")
 
@@ -114,8 +132,7 @@ func (ts *UserTestSuite) TestUserUpdateEmail() {
 			require.NoError(ts.T(), u.SetPhone(ts.API.db, c.userData["phone"]), "Error setting user phone")
 			require.NoError(ts.T(), ts.API.db.Create(u), "Error saving test user")
 
-			var token string
-			token, _, err = generateAccessToken(ts.API.db, u, nil, &ts.Config.JWT)
+			token := ts.generateAccessTokenAndSession(u)
 
 			require.NoError(ts.T(), err, "Error generating access token")
 
@@ -178,8 +195,7 @@ func (ts *UserTestSuite) TestUserUpdatePhoneAutoconfirmEnabled() {
 
 	for _, c := range cases {
 		ts.Run(c.desc, func() {
-			var token string
-			token, _, err = generateAccessToken(ts.API.db, u, nil, &ts.Config.JWT)
+			token := ts.generateAccessTokenAndSession(u)
 			require.NoError(ts.T(), err, "Error generating access token")
 
 			var buffer bytes.Buffer
@@ -193,6 +209,13 @@ func (ts *UserTestSuite) TestUserUpdatePhoneAutoconfirmEnabled() {
 			w := httptest.NewRecorder()
 			ts.API.handler.ServeHTTP(w, req)
 			require.Equal(ts.T(), c.expectedCode, w.Code)
+
+			if c.expectedCode == http.StatusOK {
+				// check that the user response returned contains the updated phone field
+				data := &models.User{}
+				require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&data))
+				require.Equal(ts.T(), data.GetPhone(), c.userData["phone"])
+			}
 		})
 	}
 
@@ -233,28 +256,28 @@ func (ts *UserTestSuite) TestUserUpdatePassword() {
 		expected                expected
 	}{
 		{
-			desc:                    "Invalid password length",
-			newPassword:             "",
+			desc:                    "Need reauthentication because outside of recently logged in window",
+			newPassword:             "newpassword123",
 			nonce:                   "",
-			requireReauthentication: false,
-			sessionId:               nil,
-			expected:                expected{code: http.StatusUnprocessableEntity, isAuthenticated: false},
+			requireReauthentication: true,
+			sessionId:               &notRecentlyLoggedIn.ID,
+			expected:                expected{code: http.StatusBadRequest, isAuthenticated: false},
 		},
 		{
 			desc:                    "No nonce provided",
 			newPassword:             "newpassword123",
 			nonce:                   "",
+			sessionId:               &notRecentlyLoggedIn.ID,
 			requireReauthentication: true,
-			sessionId:               nil,
 			expected:                expected{code: http.StatusBadRequest, isAuthenticated: false},
 		},
 		{
-			desc:                    "Need reauthentication because outside of recently logged in window",
-			newPassword:             "newpassword123",
-			nonce:                   "",
+			desc:                    "Invalid nonce",
+			newPassword:             "newpassword1234",
+			nonce:                   "123456",
+			sessionId:               &notRecentlyLoggedIn.ID,
 			requireReauthentication: true,
-			sessionId:               r2.SessionId,
-			expected:                expected{code: http.StatusBadRequest, isAuthenticated: false},
+			expected:                expected{code: http.StatusUnprocessableEntity, isAuthenticated: false},
 		},
 		{
 			desc:                    "No need reauthentication because recently logged in",
@@ -262,22 +285,6 @@ func (ts *UserTestSuite) TestUserUpdatePassword() {
 			nonce:                   "",
 			requireReauthentication: true,
 			sessionId:               r.SessionId,
-			expected:                expected{code: http.StatusOK, isAuthenticated: true},
-		},
-		{
-			desc:                    "Invalid nonce",
-			newPassword:             "newpassword1234",
-			nonce:                   "123456",
-			requireReauthentication: true,
-			sessionId:               nil,
-			expected:                expected{code: http.StatusBadRequest, isAuthenticated: false},
-		},
-		{
-			desc:                    "Valid password length",
-			newPassword:             "newpassword",
-			nonce:                   "",
-			requireReauthentication: false,
-			sessionId:               nil,
 			expected:                expected{code: http.StatusOK, isAuthenticated: true},
 		},
 	}
@@ -290,11 +297,8 @@ func (ts *UserTestSuite) TestUserUpdatePassword() {
 
 			req := httptest.NewRequest(http.MethodPut, "http://localhost/user", &buffer)
 			req.Header.Set("Content-Type", "application/json")
+			token := ts.generateToken(u, c.sessionId)
 
-			var token string
-
-			token, _, err = generateAccessToken(ts.API.db, u, c.sessionId, &ts.Config.JWT)
-			require.NoError(ts.T(), err)
 			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
 			// Setup response recorder
@@ -306,7 +310,66 @@ func (ts *UserTestSuite) TestUserUpdatePassword() {
 			u, err = models.FindUserByEmailAndAudience(ts.API.db, "test@example.com", ts.Config.JWT.Aud)
 			require.NoError(ts.T(), err)
 
-			require.Equal(ts.T(), c.expected.isAuthenticated, u.Authenticate(c.newPassword))
+			require.Equal(ts.T(), c.expected.isAuthenticated, u.Authenticate(context.Background(), c.newPassword))
+		})
+	}
+}
+
+func (ts *UserTestSuite) TestUserUpdatePasswordNoReauthenticationRequired() {
+	u, err := models.FindUserByEmailAndAudience(ts.API.db, "test@example.com", ts.Config.JWT.Aud)
+	require.NoError(ts.T(), err)
+
+	type expected struct {
+		code            int
+		isAuthenticated bool
+	}
+
+	var cases = []struct {
+		desc                    string
+		newPassword             string
+		nonce                   string
+		requireReauthentication bool
+		expected                expected
+	}{
+		{
+			desc:                    "Invalid password length",
+			newPassword:             "",
+			nonce:                   "",
+			requireReauthentication: false,
+			expected:                expected{code: http.StatusUnprocessableEntity, isAuthenticated: false},
+		},
+
+		{
+			desc:                    "Valid password length",
+			newPassword:             "newpassword",
+			nonce:                   "",
+			requireReauthentication: false,
+			expected:                expected{code: http.StatusOK, isAuthenticated: true},
+		},
+	}
+
+	for _, c := range cases {
+		ts.Run(c.desc, func() {
+			ts.Config.Security.UpdatePasswordRequireReauthentication = c.requireReauthentication
+			var buffer bytes.Buffer
+			require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(map[string]string{"password": c.newPassword, "nonce": c.nonce}))
+
+			req := httptest.NewRequest(http.MethodPut, "http://localhost/user", &buffer)
+			req.Header.Set("Content-Type", "application/json")
+			token := ts.generateAccessTokenAndSession(u)
+
+			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+
+			// Setup response recorder
+			w := httptest.NewRecorder()
+			ts.API.handler.ServeHTTP(w, req)
+			require.Equal(ts.T(), c.expected.code, w.Code)
+
+			// Request body
+			u, err = models.FindUserByEmailAndAudience(ts.API.db, "test@example.com", ts.Config.JWT.Aud)
+			require.NoError(ts.T(), err)
+
+			require.Equal(ts.T(), c.expected.isAuthenticated, u.Authenticate(context.Background(), c.newPassword))
 		})
 	}
 }
@@ -322,9 +385,7 @@ func (ts *UserTestSuite) TestUserUpdatePasswordReauthentication() {
 	u.EmailConfirmedAt = &now
 	require.NoError(ts.T(), ts.API.db.Update(u), "Error updating new test user")
 
-	var token string
-	token, _, err = generateAccessToken(ts.API.db, u, nil, &ts.Config.JWT)
-	require.NoError(ts.T(), err)
+	token := ts.generateAccessTokenAndSession(u)
 
 	// request for reauthentication nonce
 	req := httptest.NewRequest(http.MethodGet, "http://localhost/reauthenticate", nil)
@@ -363,9 +424,9 @@ func (ts *UserTestSuite) TestUserUpdatePasswordReauthentication() {
 	u, err = models.FindUserByEmailAndAudience(ts.API.db, "test@example.com", ts.Config.JWT.Aud)
 	require.NoError(ts.T(), err)
 
-	require.True(ts.T(), u.Authenticate("newpass"))
+	require.True(ts.T(), u.Authenticate(context.Background(), "newpass"))
 	require.Empty(ts.T(), u.ReauthenticationToken)
-	require.NotEmpty(ts.T(), u.ReauthenticationSentAt)
+	require.Nil(ts.T(), u.ReauthenticationSentAt)
 }
 
 func (ts *UserTestSuite) TestUserUpdatePasswordLogoutOtherSessions() {

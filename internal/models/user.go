@@ -12,8 +12,8 @@ import (
 	"github.com/gobuffalo/pop/v6"
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
-	"github.com/tealbase/gotrue/internal/crypto"
-	"github.com/tealbase/gotrue/internal/storage"
+	"github.com/tealbase/auth/internal/crypto"
+	"github.com/tealbase/auth/internal/storage"
 )
 
 // User respresents a registered user with email/password authentication
@@ -66,27 +66,36 @@ type User struct {
 	UpdatedAt   time.Time  `json:"updated_at" db:"updated_at"`
 	BannedUntil *time.Time `json:"banned_until,omitempty" db:"banned_until"`
 	DeletedAt   *time.Time `json:"deleted_at,omitempty" db:"deleted_at"`
+	IsAnonymous bool       `json:"is_anonymous" db:"is_anonymous"`
 
 	DONTUSEINSTANCEID uuid.UUID `json:"-" db:"instance_id"`
 }
 
 // NewUser initializes a new user from an email, password and user data.
 func NewUser(phone, email, password, aud string, userData map[string]interface{}) (*User, error) {
-	id := uuid.Must(uuid.NewV4())
-	pw, err := crypto.GenerateFromPassword(context.Background(), password)
-	if err != nil {
-		return nil, err
+	passwordHash := ""
+
+	if password != "" {
+		pw, err := crypto.GenerateFromPassword(context.Background(), password)
+		if err != nil {
+			return nil, err
+		}
+
+		passwordHash = pw
 	}
+
 	if userData == nil {
 		userData = make(map[string]interface{})
 	}
+
+	id := uuid.Must(uuid.NewV4())
 	user := &User{
 		ID:                id,
 		Aud:               aud,
 		Email:             storage.NullString(strings.ToLower(email)),
 		Phone:             storage.NullString(phone),
 		UserMetaData:      userData,
-		EncryptedPassword: pw,
+		EncryptedPassword: passwordHash,
 	}
 	return user, nil
 }
@@ -210,9 +219,56 @@ func (u *User) UpdateAppMetaDataProviders(tx *storage.Connection) error {
 	if terr != nil {
 		return terr
 	}
-	return u.UpdateAppMetaData(tx, map[string]interface{}{
+	payload := map[string]interface{}{
 		"providers": providers,
-	})
+	}
+	if len(providers) > 0 {
+		payload["provider"] = providers[0]
+	}
+	return u.UpdateAppMetaData(tx, payload)
+}
+
+// UpdateUserEmail updates the user's email to one of the identity's email
+// if the current email used doesn't match any of the identities email
+func (u *User) UpdateUserEmailFromIdentities(tx *storage.Connection) error {
+	identities, terr := FindIdentitiesByUserID(tx, u.ID)
+	if terr != nil {
+		return terr
+	}
+	for _, i := range identities {
+		if u.GetEmail() == i.GetEmail() {
+			// there's an existing identity that uses the same email
+			// so the user's email can be kept
+			return nil
+		}
+	}
+
+	var primaryIdentity *Identity
+	for _, i := range identities {
+		if _, terr := FindUserByEmailAndAudience(tx, i.GetEmail(), u.Aud); terr != nil {
+			if IsNotFoundError(terr) {
+				// the identity's email is not used by another user
+				// so we can set it as the primary identity
+				primaryIdentity = i
+				break
+			}
+			return terr
+		}
+	}
+	if primaryIdentity == nil {
+		return UserEmailUniqueConflictError{}
+	}
+	// default to the first identity's email
+	if terr := u.SetEmail(tx, primaryIdentity.GetEmail()); terr != nil {
+		return terr
+	}
+	if primaryIdentity.GetEmail() == "" {
+		u.EmailConfirmedAt = nil
+		if terr := tx.UpdateOnly(u, "email_confirmed_at"); terr != nil {
+			return terr
+		}
+	}
+	return nil
 }
 
 // SetEmail sets the user's email
@@ -227,14 +283,38 @@ func (u *User) SetPhone(tx *storage.Connection, phone string) error {
 	return tx.UpdateOnly(u, "phone")
 }
 
-// UpdatePassword updates the user's password
-func (u *User) UpdatePassword(tx *storage.Connection, password string, sessionID *uuid.UUID) error {
-	pw, err := crypto.GenerateFromPassword(context.Background(), password)
+func (u *User) SetPassword(ctx context.Context, password string) error {
+	if password == "" {
+		u.EncryptedPassword = ""
+		return nil
+	}
+
+	pw, err := crypto.GenerateFromPassword(ctx, password)
 	if err != nil {
 		return err
 	}
+
 	u.EncryptedPassword = pw
-	if err := tx.UpdateOnly(u, "encrypted_password"); err != nil {
+
+	return nil
+}
+
+// UpdatePassword updates the user's password. Use SetPassword outside of a transaction first!
+func (u *User) UpdatePassword(tx *storage.Connection, sessionID *uuid.UUID) error {
+	// These need to be reset because password change may mean the user no longer trusts the actions performed by the previous password.
+	u.ConfirmationToken = ""
+	u.ConfirmationSentAt = nil
+	u.RecoveryToken = ""
+	u.RecoverySentAt = nil
+	u.EmailChangeTokenCurrent = ""
+	u.EmailChangeTokenNew = ""
+	u.EmailChangeSentAt = nil
+	u.PhoneChangeToken = ""
+	u.PhoneChangeSentAt = nil
+	u.ReauthenticationToken = ""
+	u.ReauthenticationSentAt = nil
+
+	if err := tx.UpdateOnly(u, "encrypted_password", "confirmation_token", "confirmation_sent_at", "recovery_token", "recovery_sent_at", "email_change_token_current", "email_change_token_new", "email_change_sent_at", "phone_change_token", "phone_change_sent_at", "reauthentication_token", "reauthentication_sent_at"); err != nil {
 		return err
 	}
 
@@ -247,15 +327,9 @@ func (u *User) UpdatePassword(tx *storage.Connection, password string, sessionID
 	}
 }
 
-// UpdatePhone updates the user's phone
-func (u *User) UpdatePhone(tx *storage.Connection, phone string) error {
-	u.Phone = storage.NullString(phone)
-	return tx.UpdateOnly(u, "phone")
-}
-
 // Authenticate a user from a password
-func (u *User) Authenticate(password string) bool {
-	err := crypto.CompareHashAndPassword(context.Background(), u.EncryptedPassword, password)
+func (u *User) Authenticate(ctx context.Context, password string) bool {
+	err := crypto.CompareHashAndPassword(ctx, u.EncryptedPassword, password)
 	return err == nil
 }
 
@@ -531,8 +605,8 @@ func FindUsersInAudience(tx *storage.Connection, aud string, pageParams *Paginat
 func FindUserByEmailChangeCurrentAndAudience(tx *storage.Connection, email, token, aud string) (*User, error) {
 	return findUser(
 		tx,
-		"instance_id = ? and LOWER(email) = ? and email_change_token_current = ? and aud = ? and is_sso_user = false",
-		uuid.Nil, strings.ToLower(email), token, aud,
+		"instance_id = ? and LOWER(email) = ? and aud = ? and is_sso_user = false and (email_change_token_current = 'pkce_' || ? or email_change_token_current = ?)",
+		uuid.Nil, strings.ToLower(email), aud, token, token,
 	)
 }
 
@@ -540,8 +614,8 @@ func FindUserByEmailChangeCurrentAndAudience(tx *storage.Connection, email, toke
 func FindUserByEmailChangeNewAndAudience(tx *storage.Connection, email, token, aud string) (*User, error) {
 	return findUser(
 		tx,
-		"instance_id = ? and LOWER(email_change) = ? and email_change_token_new = ? and aud = ? and is_sso_user = false",
-		uuid.Nil, strings.ToLower(email), token, aud,
+		"instance_id = ? and LOWER(email_change) = ? and aud = ? and is_sso_user = false and (email_change_token_new = 'pkce_' || ? or email_change_token_new = ?)",
+		uuid.Nil, strings.ToLower(email), aud, token, token,
 	)
 }
 
@@ -577,20 +651,27 @@ func IsDuplicatedEmail(tx *storage.Connection, email, aud string, currentUser *U
 
 	userIDs := make(map[string]uuid.UUID)
 	for _, identity := range identities {
-		if !identity.IsForSSOProvider() {
-			if (currentUser != nil && currentUser.ID != identity.UserID) || (currentUser == nil) {
+		if _, ok := userIDs[identity.UserID.String()]; !ok {
+			if !identity.IsForSSOProvider() {
 				userIDs[identity.UserID.String()] = identity.UserID
 			}
 		}
 	}
 
+	var currentUserId uuid.UUID
+	if currentUser != nil {
+		currentUserId = currentUser.ID
+	}
+
 	for _, userID := range userIDs {
-		user, err := FindUserByID(tx, userID)
-		if err != nil {
-			return nil, errors.Wrap(err, "unable to find user from email identity for duplicates")
-		}
-		if user.Aud == aud {
-			return user, nil
+		if userID != currentUserId {
+			user, err := FindUserByID(tx, userID)
+			if err != nil {
+				return nil, errors.Wrap(err, "unable to find user from email identity for duplicates")
+			}
+			if user.Aud == aud {
+				return user, nil
+			}
 		}
 	}
 
@@ -640,58 +721,36 @@ func (u *User) UpdateBannedUntil(tx *storage.Connection) error {
 }
 
 // RemoveUnconfirmedIdentities removes potentially malicious unconfirmed identities from a user (if any)
-func (u *User) RemoveUnconfirmedIdentities(tx *storage.Connection) error {
-	if u.IsConfirmed() {
-		return nil
-	}
-
-	u.EncryptedPassword = ""
-
-	if terr := tx.UpdateOnly(u, "encrypted_password"); terr != nil {
-		return terr
-	}
-
-	if providersList, ok := u.AppMetaData["providers"].([]string); ok {
-		// user has "providers" metadata, and the "email" provider
-		// should be removed from it
-
-		var confirmedProviders []string
-
-		for _, provider := range providersList {
-			if provider != "email" {
-				confirmedProviders = append(confirmedProviders, provider)
-			}
-		}
-
-		u.AppMetaData["providers"] = confirmedProviders
-
-		if len(confirmedProviders) > 0 {
-			u.AppMetaData["provider"] = confirmedProviders[0]
-		} else {
-			u.AppMetaData["provider"] = nil
-		}
-
-		if terr := u.UpdateAppMetaData(tx, u.AppMetaData); terr != nil {
+func (u *User) RemoveUnconfirmedIdentities(tx *storage.Connection, identity *Identity) error {
+	if identity.Provider != "email" && identity.Provider != "phone" {
+		// user is unconfirmed so the password should be reset
+		u.EncryptedPassword = ""
+		if terr := tx.UpdateOnly(u, "encrypted_password"); terr != nil {
 			return terr
 		}
 	}
 
-	// finally, remove any identity with the "email" provider
+	// user is unconfirmed so existing user_metadata should be overwritten
+	// to use the current identity metadata
+	u.UserMetaData = identity.IdentityData
+	if terr := u.UpdateUserMetaData(tx, u.UserMetaData); terr != nil {
+		return terr
+	}
 
-	var confirmedProviders []Identity
-
-	for i, identity := range u.Identities {
-		if identity.Provider == "email" {
+	// finally, remove all identities except the current identity being authenticated
+	for i := range u.Identities {
+		if u.Identities[i].ID != identity.ID {
 			if terr := tx.Destroy(&u.Identities[i]); terr != nil {
 				return terr
 			}
-		} else {
-			confirmedProviders = append(confirmedProviders, identity)
 		}
 	}
 
-	u.Identities = confirmedProviders
-
+	// user is unconfirmed so none of the providers associated to it are verified yet
+	// only the current provider should be kept
+	if terr := u.UpdateAppMetaDataProviders(tx); terr != nil {
+		return terr
+	}
 	return nil
 }
 
@@ -773,10 +832,9 @@ func (u *User) SoftDeleteUserIdentities(tx *storage.Connection) error {
 		if err := tx.RawQuery(
 			"update "+
 				(&pop.Model{Value: Identity{}}).TableName()+
-				" set id = ? where id = ? and provider = ?",
-			obfuscateIdentityId(identity),
+				" set provider_id = ? where id = ?",
+			obfuscateIdentityProviderId(identity),
 			identity.ID,
-			identity.Provider,
 		).Exec(); err != nil {
 			return err
 		}
@@ -798,6 +856,6 @@ func obfuscatePhone(u *User, phone string) string {
 	return obfuscateValue(u.ID, phone)[:15]
 }
 
-func obfuscateIdentityId(identity *Identity) string {
-	return obfuscateValue(identity.UserID, identity.Provider+":"+identity.ID)
+func obfuscateIdentityProviderId(identity *Identity) string {
+	return obfuscateValue(identity.UserID, identity.Provider+":"+identity.ProviderID)
 }

@@ -9,7 +9,7 @@ import (
 	"github.com/gobuffalo/pop/v6"
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
-	"github.com/tealbase/gotrue/internal/storage"
+	"github.com/tealbase/auth/internal/storage"
 )
 
 type FactorState int
@@ -44,6 +44,8 @@ const (
 	MagicLink
 	EmailSignup
 	EmailChange
+	TokenRefresh
+	Anonymous
 )
 
 func (authMethod AuthenticationMethod) String() string {
@@ -68,6 +70,10 @@ func (authMethod AuthenticationMethod) String() string {
 		return "email/signup"
 	case EmailChange:
 		return "email_change"
+	case TokenRefresh:
+		return "token_refresh"
+	case Anonymous:
+		return "anonymous"
 	}
 	return ""
 }
@@ -97,6 +103,8 @@ func ParseAuthenticationMethod(authMethod string) (AuthenticationMethod, error) 
 		return EmailSignup, nil
 	case "email_change":
 		return EmailChange, nil
+	case "token_refresh":
+		return TokenRefresh, nil
 	}
 	return 0, fmt.Errorf("unsupported authentication method %q", authMethod)
 }
@@ -119,7 +127,7 @@ func (Factor) TableName() string {
 	return tableName
 }
 
-func NewFactor(user *User, friendlyName string, factorType string, state FactorState, secret string) (*Factor, error) {
+func NewFactor(user *User, friendlyName string, factorType string, state FactorState, secret string) *Factor {
 	id := uuid.Must(uuid.NewV4())
 
 	factor := &Factor{
@@ -130,39 +138,18 @@ func NewFactor(user *User, friendlyName string, factorType string, state FactorS
 		Secret:       secret,
 		FactorType:   factorType,
 	}
-	return factor, nil
+	return factor
 }
 
-// FindFactorsByUser returns all factors belonging to a user ordered by timestamp
-func FindFactorsByUser(tx *storage.Connection, user *User) ([]*Factor, error) {
-	factors := []*Factor{}
-	if err := tx.Q().Where("user_id = ?", user.ID).Order("created_at asc").All(&factors); err != nil {
-		if errors.Cause(err) == sql.ErrNoRows {
-			return factors, nil
-		}
-		return nil, errors.Wrap(err, "Database error when finding MFA factors associated to user")
-	}
-	return factors, nil
-}
-
-func FindFactorByFactorID(tx *storage.Connection, factorID uuid.UUID) (*Factor, error) {
-	factor, err := findFactor(tx, "id = ?", factorID)
-	if err != nil {
+func FindFactorByFactorID(conn *storage.Connection, factorID uuid.UUID) (*Factor, error) {
+	var factor Factor
+	err := conn.Find(&factor, factorID)
+	if err != nil && errors.Cause(err) == sql.ErrNoRows {
 		return nil, FactorNotFoundError{}
+	} else if err != nil {
+		return nil, err
 	}
-	return factor, nil
-}
-
-func findFactor(tx *storage.Connection, query string, args ...interface{}) (*Factor, error) {
-	obj := &Factor{}
-	if err := tx.Eager().Q().Where(query, args...).First(obj); err != nil {
-		if errors.Cause(err) == sql.ErrNoRows {
-			return nil, FactorNotFoundError{}
-		}
-		return nil, errors.Wrap(err, "Database error finding factor")
-	}
-
-	return obj, nil
+	return &factor, nil
 }
 
 func DeleteUnverifiedFactors(tx *storage.Connection, user *User) error {
@@ -214,6 +201,20 @@ func (f *Factor) IsVerified() bool {
 
 func DeleteFactorsByUserId(tx *storage.Connection, userId uuid.UUID) error {
 	if err := tx.RawQuery("DELETE FROM "+(&pop.Model{Value: Factor{}}).TableName()+" WHERE user_id = ?", userId).Exec(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func DeleteExpiredFactors(tx *storage.Connection, validityDuration time.Duration) error {
+	totalSeconds := int64(validityDuration / time.Second)
+	validityInterval := fmt.Sprintf("interval '%d seconds'", totalSeconds)
+
+	factorTable := (&pop.Model{Value: Factor{}}).TableName()
+	challengeTable := (&pop.Model{Value: Challenge{}}).TableName()
+
+	query := fmt.Sprintf(`delete from %q where status != 'verified' and not exists (select * from %q where %q.id = %q.factor_id ) and created_at + %s < current_timestamp;`, factorTable, challengeTable, factorTable, challengeTable, validityInterval)
+	if err := tx.RawQuery(query).Exec(); err != nil {
 		return err
 	}
 	return nil

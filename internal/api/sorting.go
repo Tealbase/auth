@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/tealbase/gotrue/internal/models"
+	"github.com/tealbase/auth/internal/models"
 )
 
 func sort(r *http.Request, allowedFields map[string]bool, defaultSort []models.SortField) (*models.SortParams, error) {
