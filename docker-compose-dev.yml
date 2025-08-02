@@ -1,0 +1,34 @@
+version: "3.9"
+services:
+  gotrue:
+    container_name: gotrue
+    depends_on:
+      - postgres
+    build:
+      context: ./
+      dockerfile: Dockerfile.dev
+    ports:
+      - '9999:9999'
+      - '9100:9100'
+    environment:
+      - GOTRUE_DB_MIGRATIONS_PATH=/go/src/github.com/tealbase/gotrue/migrations
+    volumes:
+      - ./:/go/src/github.com/tealbase/gotrue
+    command: CompileDaemon --build="make build" --directory=/go/src/github.com/tealbase/gotrue --recursive=true -pattern="(.+\.go|.+\.env)" -exclude=gotrue -exclude=gotrue-arm64 -exclude=.env --command="/go/src/github.com/tealbase/gotrue/gotrue -c=.env.docker"
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres.dev
+    container_name: gotrue_postgres
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=root
+      - POSTGRES_DB=postgres
+      # sets the schema name, this should match the `NAMESPACE` env var set in your .env file
+      - DB_NAMESPACE=auth 
+volumes:
+  postgres_data:
