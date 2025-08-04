@@ -25,6 +25,7 @@ jobs:
             tealbase/gotrue
             public.ecr.aws/tealbase/gotrue
             ghcr.io/tealbase/gotrue
+            ghcr.io/tealbase/auth
             436098097459.dkr.ecr.us-east-1.amazonaws.com/gotrue
             646182064048.dkr.ecr.us-east-1.amazonaws.com/gotrue
             tealbase/auth
