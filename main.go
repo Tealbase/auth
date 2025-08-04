@@ -9,7 +9,6 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/tealbase/auth/cmd"
-	"github.com/tealbase/auth/internal/api"
 	"github.com/tealbase/auth/internal/observability"
 )
 
@@ -36,14 +35,6 @@ func main() {
 	defer shutdownCancel()
 
 	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		// wait for API servers to shut down gracefully
-		api.WaitForCleanup(shutdownCtx)
-	}()
 
 	wg.Add(1)
 	go func() {
