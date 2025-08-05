@@ -10,6 +10,7 @@ import (
 	"github.com/tealbase/auth/internal/api/apierrors"
 	"github.com/tealbase/auth/internal/api/provider"
 	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/metering"
 	"github.com/tealbase/auth/internal/models"
 	"github.com/tealbase/auth/internal/observability"
 	"github.com/tealbase/auth/internal/storage"
@@ -127,7 +128,12 @@ func (p *IdTokenGrantParams) getProvider(ctx context.Context, config *conf.Globa
 		return nil, false, "", nil, apierrors.NewBadRequestError(apierrors.ErrorCodeProviderDisabled, fmt.Sprintf("Provider (issuer %q) is not enabled", issuer))
 	}
 
-	oidcProvider, err := oidc.NewProvider(ctx, issuer)
+	oidcCtx := ctx
+	if providerType == "apple" {
+		oidcCtx = oidc.InsecureIssuerURLContext(ctx, issuer)
+	}
+
+	oidcProvider, err := oidc.NewProvider(oidcCtx, issuer)
 	if err != nil {
 		return nil, false, "", nil, err
 	}
@@ -160,7 +166,16 @@ func (a *API) IdTokenGrant(ctx context.Context, w http.ResponseWriter, r *http.R
 		return err
 	}
 
-	idToken, userData, err := provider.ParseIDToken(ctx, oidcProvider, nil, params.IdToken, provider.ParseIDTokenOptions{
+	var oidcConfig *oidc.Config
+
+	if providerType == "apple" {
+		oidcConfig = &oidc.Config{
+			SkipClientIDCheck: true,
+			SkipIssuerCheck:   true,
+		}
+	}
+
+	idToken, userData, err := provider.ParseIDToken(ctx, oidcProvider, oidcConfig, params.IdToken, provider.ParseIDTokenOptions{
 		SkipAccessTokenCheck: params.AccessToken == "",
 		AccessToken:          params.AccessToken,
 	})
@@ -265,6 +280,10 @@ func (a *API) IdTokenGrant(ctx context.Context, w http.ResponseWriter, r *http.R
 			return apierrors.NewOAuthError("server_error", "Internal Server Error").WithInternalError(err)
 		}
 	}
+
+	metering.RecordLogin(metering.LoginTypeOIDC, token.User.ID, &metering.LoginData{
+		Provider: providerType,
+	})
 
 	return sendJSON(w, http.StatusOK, token)
 }

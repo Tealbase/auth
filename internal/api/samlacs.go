@@ -14,6 +14,7 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/tealbase/auth/internal/api/apierrors"
 	"github.com/tealbase/auth/internal/api/provider"
+	"github.com/tealbase/auth/internal/metering"
 	"github.com/tealbase/auth/internal/models"
 	"github.com/tealbase/auth/internal/observability"
 	"github.com/tealbase/auth/internal/storage"
@@ -328,6 +329,14 @@ func (a *API) handleSamlAcs(w http.ResponseWriter, r *http.Request) error {
 		return nil
 
 	}
+
+	// Record login for analytics - only when token is issued (not during pkce authorize)
+	if token != nil {
+		metering.RecordLogin(metering.LoginTypeSSO, token.User.ID, &metering.LoginData{
+			Provider: metering.ProviderSAML,
+		})
+	}
+
 	http.Redirect(w, r, token.AsRedirectURL(redirectTo, url.Values{}), http.StatusFound)
 
 	return nil

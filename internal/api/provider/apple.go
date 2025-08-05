@@ -15,8 +15,8 @@ import (
 	"golang.org/x/oauth2"
 )
 
-const DefaultAppleIssuer = "https://account.apple.com"
-const OtherAppleIssuer = "https://appleid.apple.com"
+const DefaultAppleIssuer = "https://appleid.apple.com"
+const OtherAppleIssuer = "https://account.apple.com"
 
 func IsAppleIssuer(issuer string) bool {
 	return issuer == DefaultAppleIssuer || issuer == OtherAppleIssuer
@@ -148,7 +148,8 @@ func (p AppleProvider) GetUserData(ctx context.Context, tok *oauth2.Token) (*Use
 	}
 
 	_, data, err := ParseIDToken(ctx, p.oidc, &oidc.Config{
-		ClientID: p.ClientID,
+		ClientID:        p.ClientID,
+		SkipIssuerCheck: true,
 	}, idToken.(string), ParseIDTokenOptions{
 		AccessToken: tok.AccessToken,
 	})
