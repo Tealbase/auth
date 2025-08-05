@@ -163,20 +163,25 @@ func (a *APIConfiguration) Validate() error {
 }
 
 type SessionsConfiguration struct {
-	Timebox           *time.Duration `json:"timebox"`
+	Timebox           *time.Duration `json:"timebox,omitempty"`
 	InactivityTimeout *time.Duration `json:"inactivity_timeout,omitempty" split_words:"true"`
+	AllowLowAAL       *time.Duration `json:"allow_low_aal,omitempty" split_words:"true"`
 
 	SinglePerUser bool     `json:"single_per_user" split_words:"true"`
 	Tags          []string `json:"tags,omitempty"`
 }
 
 func (c *SessionsConfiguration) Validate() error {
-	if c.Timebox == nil {
-		return nil
+	if c.Timebox != nil && *c.Timebox <= time.Duration(0) {
+		return fmt.Errorf("conf: session timebox duration must be positive when set, was %v", (*c.Timebox).String())
 	}
 
-	if *c.Timebox <= time.Duration(0) {
-		return fmt.Errorf("conf: session timebox duration must be positive when set, was %v", (*c.Timebox).String())
+	if c.InactivityTimeout != nil && *c.InactivityTimeout <= time.Duration(0) {
+		return fmt.Errorf("conf: session inactivity timeout duration must be positive when set, was %v", (*c.InactivityTimeout).String())
+	}
+
+	if c.AllowLowAAL != nil && *c.AllowLowAAL <= time.Duration(0) {
+		return fmt.Errorf("conf: session allow low AAL duration must be positive when set, was %v", (*c.AllowLowAAL).String())
 	}
 
 	return nil
@@ -257,6 +262,7 @@ type GlobalConfiguration struct {
 	RateLimitSso            float64 `split_words:"true" default:"30"`
 	RateLimitAnonymousUsers float64 `split_words:"true" default:"30"`
 	RateLimitOtp            float64 `split_words:"true" default:"30"`
+	RateLimitWeb3           float64 `split_words:"true" default:"30"`
 
 	SiteURL         string   `json:"site_url" split_words:"true" required:"true"`
 	URIAllowList    []string `json:"uri_allow_list" split_words:"true"`
@@ -339,6 +345,13 @@ type ProviderConfiguration struct {
 	RedirectURL             string                         `json:"redirect_url"`
 	AllowedIdTokenIssuers   []string                       `json:"allowed_id_token_issuers" split_words:"true"`
 	FlowStateExpiryDuration time.Duration                  `json:"flow_state_expiry_duration" split_words:"true"`
+
+	Web3Solana SolanaConfiguration `json:"web3_solana" split_words:"true"`
+}
+
+type SolanaConfiguration struct {
+	Enabled                 bool          `json:"enabled,omitempty" split_words:"true"`
+	MaximumValidityDuration time.Duration `json:"maximum_validity_duration,omitempty" default:"10m" split_words:"true"`
 }
 
 type SMTPConfiguration struct {
@@ -404,8 +417,10 @@ type MailerConfiguration struct {
 	EmailValidationExtended       bool   `json:"email_validation_extended" split_words:"true" default:"false"`
 	EmailValidationServiceURL     string `json:"email_validation_service_url" split_words:"true"`
 	EmailValidationServiceHeaders string `json:"email_validation_service_headers" split_words:"true"`
+	EmailValidationBlockedMX      string `json:"email_validation_blocked_mx" split_words:"true"`
 
-	serviceHeaders map[string][]string `json:"-"`
+	serviceHeaders   map[string][]string `json:"-"`
+	blockedMXRecords map[string]bool     `json:"-"`
 }
 
 func (c *MailerConfiguration) Validate() error {
@@ -421,11 +436,33 @@ func (c *MailerConfiguration) Validate() error {
 	if len(headers) > 0 {
 		c.serviceHeaders = headers
 	}
+
+	// EmailValidationBlockedMX is a JSON array in the config string for brevity.
+	var blockedMXRecords map[string]bool
+	if c.EmailValidationBlockedMX != "" {
+		var blockedMXArray []string
+		err := json.Unmarshal([]byte(c.EmailValidationBlockedMX), &blockedMXArray)
+		if err != nil {
+			return fmt.Errorf("conf: email_validation_blocked_mx is not a valid JSON array: %w", err)
+		}
+		blockedMXRecords = make(map[string]bool, len(blockedMXArray)*2)
+		for _, record := range blockedMXArray {
+			blockedMXRecords[record] = true
+			blockedMXRecords[record+"."] = true
+		}
+	}
+
+	c.blockedMXRecords = blockedMXRecords
+
 	return nil
 }
 
 func (c *MailerConfiguration) GetEmailValidationServiceHeaders() map[string][]string {
 	return c.serviceHeaders
+}
+
+func (c *MailerConfiguration) GetEmailValidationBlockedMXRecords() map[string]bool {
+	return c.blockedMXRecords
 }
 
 type PhoneProviderConfiguration struct {

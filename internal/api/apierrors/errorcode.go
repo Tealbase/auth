@@ -1,4 +1,4 @@
-package api
+package apierrors
 
 type ErrorCode = string
 
@@ -92,4 +92,6 @@ const (
 	ErrorCodeInvalidCredentials        ErrorCode = "invalid_credentials"
 	ErrorCodeEmailAddressNotAuthorized ErrorCode = "email_address_not_authorized"
 	ErrorCodeEmailAddressInvalid       ErrorCode = "email_address_invalid"
+	ErrorCodeWeb3ProviderDisabled      ErrorCode = "web3_provider_disabled"
+	ErrorCodeWeb3UnsupportedChain      ErrorCode = "web3_unsupported_chain"
 )

@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/sirupsen/logrus"
+	"github.com/tealbase/auth/internal/api/apierrors"
 	"github.com/tealbase/auth/internal/models"
 	"github.com/tealbase/auth/internal/storage"
 )
@@ -35,7 +36,7 @@ func (a *API) Logout(w http.ResponseWriter, r *http.Request) error {
 			scope = LogoutOthers
 
 		default:
-			return badRequestError(ErrorCodeValidationFailed, fmt.Sprintf("Unsupported logout scope %q", r.URL.Query().Get("scope")))
+			return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, fmt.Sprintf("Unsupported logout scope %q", r.URL.Query().Get("scope")))
 		}
 	}
 
@@ -64,7 +65,7 @@ func (a *API) Logout(w http.ResponseWriter, r *http.Request) error {
 		return models.Logout(tx, u.ID)
 	})
 	if err != nil {
-		return internalServerError("Error logging out user").WithInternalError(err)
+		return apierrors.NewInternalServerError("Error logging out user").WithInternalError(err)
 	}
 
 	w.WriteHeader(http.StatusNoContent)
