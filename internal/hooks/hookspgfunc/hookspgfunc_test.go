@@ -182,46 +182,77 @@ func TestDispatch(t *testing.T) {
 				end; $$ language plpgsql;`,
 			errStr: "500: Error unmarshaling JSON output.",
 		},
+
+		{
+			desc: "fail - returned error",
+			cfg: conf.ExtensibilityPointConfiguration{
+				URI:      `pg-functions://postgres/auth/v0pgfunc_test_return_input`,
+				HookName: `"auth"."v0pgfunc_test_return_input"`,
+			},
+			req: M{"error": M{"message": "failed"}},
+			sql: `
+				create or replace function v0pgfunc_test_return_input(input jsonb)
+				returns json as $$
+				begin
+					return input;
+				end; $$ language plpgsql;`,
+			errStr: "500: failed",
+		},
+
+		{
+			desc: "fail - returned error with status",
+			cfg: conf.ExtensibilityPointConfiguration{
+				URI:      `pg-functions://postgres/auth/v0pgfunc_test_return_input`,
+				HookName: `"auth"."v0pgfunc_test_return_input"`,
+			},
+			req: M{"error": M{"message": "failed", "http_code": 403}},
+			sql: `
+				create or replace function v0pgfunc_test_return_input(input jsonb)
+				returns json as $$
+				begin
+					return input;
+				end; $$ language plpgsql;`,
+			errStr: "403: failed",
+		},
 	}
 
-	for idx, tc := range cases {
-		t.Logf("test #%v - %v", idx, tc.desc)
-
-		testCtx := tc.ctx
-		if testCtx == nil {
-			testCtx = ctx
-		}
-
-		dr := tc.dr
-		if dr == nil {
-			dr = New(
-				db,
-				WithTimeout(time.Second*2),
-			)
-		}
-
-		sql := tc.sql
-		if sql != "" {
-			if err := db.RawQuery(sql).Exec(); err != nil {
-				t.Fatalf("exp nil err; got %v", err)
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			testCtx := tc.ctx
+			if testCtx == nil {
+				testCtx = ctx
 			}
-		}
 
-		tx := tc.tx
-		cfg := tc.cfg
-		res := M{}
-		err := dr.Dispatch(testCtx, cfg, tx, tc.req, &res)
-		if tc.err != nil {
-			require.Error(t, err)
-			require.Equal(t, tc.err, err)
-			continue
-		}
-		if tc.errStr != "" {
-			require.Error(t, err)
-			require.Contains(t, err.Error(), tc.errStr)
-			continue
-		}
-		require.NoError(t, err)
-		require.Equal(t, tc.exp, res)
+			dr := tc.dr
+			if dr == nil {
+				dr = New(
+					db,
+					WithTimeout(time.Second*2),
+				)
+			}
+
+			sql := tc.sql
+			if sql != "" {
+				err := db.RawQuery(sql).Exec()
+				require.NoError(t, err)
+			}
+
+			tx := tc.tx
+			cfg := tc.cfg
+			res := M{}
+			err := dr.Dispatch(testCtx, &cfg, tx, tc.req, &res)
+			if tc.err != nil {
+				require.Error(t, err)
+				require.Equal(t, tc.err, err)
+				return
+			}
+			if tc.errStr != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.errStr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.exp, res)
+		})
 	}
 }
