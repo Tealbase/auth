@@ -3,6 +3,7 @@ package conf
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -18,6 +19,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/lestrrat-go/jwx/v2/jwk"
+	"gopkg.in/gomail.v2"
 )
 
 const defaultMinPasswordLength int = 6
@@ -237,18 +239,19 @@ type PasswordConfiguration struct {
 
 // GlobalConfiguration holds all the configuration that applies to all instances.
 type GlobalConfiguration struct {
-	API                     APIConfiguration
-	DB                      DBConfiguration
-	External                ProviderConfiguration
-	Logging                 LoggingConfig  `envconfig:"LOG"`
-	Profiler                ProfilerConfig `envconfig:"PROFILER"`
-	OperatorToken           string         `split_words:"true" required:"false"`
-	Tracing                 TracingConfig
-	Metrics                 MetricsConfig
-	SMTP                    SMTPConfiguration
+	API           APIConfiguration
+	DB            DBConfiguration
+	External      ProviderConfiguration
+	Logging       LoggingConfig  `envconfig:"LOG"`
+	Profiler      ProfilerConfig `envconfig:"PROFILER"`
+	OperatorToken string         `split_words:"true" required:"false"`
+	Tracing       TracingConfig
+	Metrics       MetricsConfig
+	SMTP          SMTPConfiguration
+
 	RateLimitHeader         string  `split_words:"true"`
-	RateLimitEmailSent      float64 `split_words:"true" default:"30"`
-	RateLimitSmsSent        float64 `split_words:"true" default:"30"`
+	RateLimitEmailSent      Rate    `split_words:"true" default:"30"`
+	RateLimitSmsSent        Rate    `split_words:"true" default:"30"`
 	RateLimitVerify         float64 `split_words:"true" default:"30"`
 	RateLimitTokenRefresh   float64 `split_words:"true" default:"150"`
 	RateLimitSso            float64 `split_words:"true" default:"30"`
@@ -339,17 +342,47 @@ type ProviderConfiguration struct {
 }
 
 type SMTPConfiguration struct {
-	MaxFrequency time.Duration `json:"max_frequency" split_words:"true"`
-	Host         string        `json:"host"`
-	Port         int           `json:"port,omitempty" default:"587"`
-	User         string        `json:"user"`
-	Pass         string        `json:"pass,omitempty"`
-	AdminEmail   string        `json:"admin_email" split_words:"true"`
-	SenderName   string        `json:"sender_name" split_words:"true"`
+	MaxFrequency   time.Duration `json:"max_frequency" split_words:"true"`
+	Host           string        `json:"host"`
+	Port           int           `json:"port,omitempty" default:"587"`
+	User           string        `json:"user"`
+	Pass           string        `json:"pass,omitempty"`
+	AdminEmail     string        `json:"admin_email" split_words:"true"`
+	SenderName     string        `json:"sender_name" split_words:"true"`
+	Headers        string        `json:"headers"`
+	LoggingEnabled bool          `json:"logging_enabled" split_words:"true" default:"false"`
+
+	fromAddress       string              `json:"-"`
+	normalizedHeaders map[string][]string `json:"-"`
 }
 
 func (c *SMTPConfiguration) Validate() error {
+	headers := make(map[string][]string)
+
+	if c.Headers != "" {
+		err := json.Unmarshal([]byte(c.Headers), &headers)
+		if err != nil {
+			return fmt.Errorf("conf: SMTP headers not a map[string][]string format: %w", err)
+		}
+	}
+
+	if len(headers) > 0 {
+		c.normalizedHeaders = headers
+	}
+
+	mail := gomail.NewMessage()
+
+	c.fromAddress = mail.FormatAddress(c.AdminEmail, c.SenderName)
+
 	return nil
+}
+
+func (c *SMTPConfiguration) FromAddress() string {
+	return c.fromAddress
+}
+
+func (c *SMTPConfiguration) NormalizedHeaders() map[string][]string {
+	return c.normalizedHeaders
 }
 
 type MailerConfiguration struct {

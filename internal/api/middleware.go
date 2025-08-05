@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -77,39 +76,6 @@ func (a *API) limitHandler(lmt *limiter.Limiter) middlewareHandler {
 	}
 }
 
-func (a *API) limitEmailOrPhoneSentHandler() middlewareHandler {
-	// limit per hour
-	emailFreq := a.config.RateLimitEmailSent / (60 * 60)
-	smsFreq := a.config.RateLimitSmsSent / (60 * 60)
-
-	emailLimiter := tollbooth.NewLimiter(emailFreq, &limiter.ExpirableOptions{
-		DefaultExpirationTTL: time.Hour,
-	}).SetBurst(int(a.config.RateLimitEmailSent)).SetMethods([]string{"PUT", "POST"})
-
-	phoneLimiter := tollbooth.NewLimiter(smsFreq, &limiter.ExpirableOptions{
-		DefaultExpirationTTL: time.Hour,
-	}).SetBurst(int(a.config.RateLimitSmsSent)).SetMethods([]string{"PUT", "POST"})
-
-	return func(w http.ResponseWriter, req *http.Request) (context.Context, error) {
-		c := req.Context()
-		config := a.config
-		shouldRateLimitEmail := config.External.Email.Enabled && !config.Mailer.Autoconfirm
-		shouldRateLimitPhone := config.External.Phone.Enabled && !config.Sms.Autoconfirm
-
-		if shouldRateLimitEmail || shouldRateLimitPhone {
-			if req.Method == "PUT" || req.Method == "POST" {
-				// store rate limiter in request context
-				c = withLimiter(c, &SharedLimiter{
-					EmailLimiter: emailLimiter,
-					PhoneLimiter: phoneLimiter,
-				})
-			}
-		}
-
-		return c, nil
-	}
-}
-
 func (a *API) requireAdminCredentials(w http.ResponseWriter, req *http.Request) (context.Context, error) {
 	t, err := a.extractBearerToken(req)
 	if err != nil || t == "" {
@@ -169,43 +135,6 @@ func isIgnoreCaptchaRoute(req *http.Request) bool {
 		return true
 	}
 	return false
-}
-
-var emailLabelPattern = regexp.MustCompile("[+][^@]+@")
-
-func (a *API) isValidAuthorizedEmail(w http.ResponseWriter, req *http.Request) (context.Context, error) {
-	ctx := req.Context()
-
-	// skip checking for authorized email addresses if it's an admin request
-	if strings.HasPrefix(req.URL.Path, "/admin") || req.Method == http.MethodGet || req.Method == http.MethodDelete {
-		return ctx, nil
-	}
-
-	var body struct {
-		Email string `json:"email"`
-	}
-
-	if err := retrieveRequestParams(req, &body); err != nil {
-		// let downstream handlers handle the error
-		return ctx, nil
-	}
-	if body.Email == "" {
-		return ctx, nil
-	}
-	email := strings.ToLower(body.Email)
-	if len(a.config.External.Email.AuthorizedAddresses) > 0 {
-		// allow labelled emails when authorization rules are in place
-		normalized := emailLabelPattern.ReplaceAllString(email, "@")
-
-		for _, authorizedAddress := range a.config.External.Email.AuthorizedAddresses {
-			if normalized == authorizedAddress {
-				return ctx, nil
-			}
-		}
-
-		return ctx, badRequestError(ErrorCodeEmailAddressNotAuthorized, "Email address %q cannot be used as it is not authorized", email)
-	}
-	return ctx, nil
 }
 
 func (a *API) isValidExternalHost(w http.ResponseWriter, req *http.Request) (context.Context, error) {

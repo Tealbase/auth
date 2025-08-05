@@ -86,6 +86,9 @@ func (ts *MFATestSuite) SetupTest() {
 	ts.Config.MFA.Phone.EnrollEnabled = true
 	ts.Config.MFA.Phone.VerifyEnabled = true
 
+	ts.Config.MFA.WebAuthn.EnrollEnabled = true
+	ts.Config.MFA.WebAuthn.VerifyEnabled = true
+
 	key, err := totp.Generate(totp.GenerateOpts{
 		Issuer:      ts.TestDomain,
 		AccountName: ts.TestEmail,
@@ -169,6 +172,12 @@ func (ts *MFATestSuite) TestEnrollFactor() {
 			factorType:   models.Phone,
 			phone:        "",
 			expectedCode: http.StatusBadRequest,
+		},
+		{
+			desc:         "WebAuthn: Enroll with friendly name",
+			friendlyName: "webauthn_factor",
+			factorType:   models.WebAuthn,
+			expectedCode: http.StatusOK,
 		},
 	}
 	for _, c := range cases {
@@ -290,9 +299,7 @@ func (ts *MFATestSuite) TestDuplicateTOTPEnrollsReturnExpectedMessage() {
 	err := json.NewDecoder(response.Body).Decode(&errorResponse)
 	require.NoError(ts.T(), err)
 
-	// Convert the response body to a string and check for the expected error message
-	expectedErrorMessage := fmt.Sprintf("A factor with the friendly name %q for this user likely already exists", friendlyName)
-	require.Contains(ts.T(), errorResponse.Message, expectedErrorMessage)
+	require.Contains(ts.T(), errorResponse.ErrorCode, ErrorCodeMFAFactorNameConflict)
 }
 
 func (ts *MFATestSuite) AAL2RequiredToUpdatePasswordAfterEnrollment() {
@@ -369,7 +376,7 @@ func (ts *MFATestSuite) TestMultipleEnrollsCleanupExpiredFactors() {
 	var w *httptest.ResponseRecorder
 	token := accessTokenResp.Token
 	for i := 0; i < numFactors; i++ {
-		w = performEnrollFlow(ts, token, "", models.TOTP, "https://issuer.com", "", http.StatusOK)
+		w = performEnrollFlow(ts, token, "first-name", models.TOTP, "https://issuer.com", "", http.StatusOK)
 	}
 
 	enrollResp := EnrollFactorResponse{}
@@ -379,7 +386,7 @@ func (ts *MFATestSuite) TestMultipleEnrollsCleanupExpiredFactors() {
 	_ = performChallengeFlow(ts, enrollResp.ID, token)
 
 	// Enroll another Factor (Factor 3)
-	_ = performEnrollFlow(ts, token, "", models.TOTP, "https://issuer.com", "", http.StatusOK)
+	_ = performEnrollFlow(ts, token, "second-name", models.TOTP, "https://issuer.com", "", http.StatusOK)
 	require.NoError(ts.T(), ts.API.db.Eager("Factors").Find(ts.TestUser, ts.TestUser.ID))
 	require.Equal(ts.T(), 3, len(ts.TestUser.Factors))
 }
@@ -704,6 +711,27 @@ func (ts *MFATestSuite) TestMFAFollowedByPasswordSignIn() {
 	session, err := models.FindSessionByUserID(ts.API.db, accessTokenResp.User.ID)
 	require.NoError(ts.T(), err)
 	require.True(ts.T(), session.IsAAL2())
+}
+
+func (ts *MFATestSuite) TestChallengeWebAuthnFactor() {
+	factor := models.NewWebAuthnFactor(ts.TestUser, "WebAuthnfactor")
+	validWebAuthnConfiguration := &WebAuthnParams{
+		RPID:      "localhost",
+		RPOrigins: "http://localhost:3000",
+	}
+	require.NoError(ts.T(), ts.API.db.Create(factor), "Error saving new test factor")
+	token := ts.generateAAL1Token(ts.TestUser, &ts.TestSession.ID)
+	w := performChallengeWebAuthnFlow(ts, factor.ID, token, validWebAuthnConfiguration)
+	require.Equal(ts.T(), http.StatusOK, w.Code)
+}
+
+func performChallengeWebAuthnFlow(ts *MFATestSuite, factorID uuid.UUID, token string, webauthn *WebAuthnParams) *httptest.ResponseRecorder {
+	var buffer bytes.Buffer
+	err := json.NewEncoder(&buffer).Encode(ChallengeFactorParams{WebAuthn: webauthn})
+	require.NoError(ts.T(), err)
+	w := ServeAuthenticatedRequest(ts, http.MethodPost, fmt.Sprintf("http://localhost/factors/%s/challenge", factorID), token, buffer)
+	require.Equal(ts.T(), http.StatusOK, w.Code)
+	return w
 }
 
 func (ts *MFATestSuite) TestChallengeFactorNotOwnedByUser() {
