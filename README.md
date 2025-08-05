@@ -1,6 +1,6 @@
 # Auth - Authentication and User Management by tealbase
 
-[![Coverage Status](https://coveralls.io/repos/github/tealbase/auth/badge.svg?branch=master)](https://coveralls.io/github/tealbase/gotrue?branch=master)
+[![Coverage Status](https://coveralls.io/repos/github/tealbase/auth/badge.svg?branch=master)](https://coveralls.io/github/tealbase/auth?branch=master)
 
 Auth is a user management and authentication server written in Go that powers
 [tealbase](https://tealbase.com)'s features such as:
@@ -30,12 +30,12 @@ Create a `.env` file to store your own custom env vars. See [`example.env`](exam
 1. Start the local postgres database in a postgres container: `docker-compose -f docker-compose-dev.yml up postgres`
 2. Build the auth binary: `make build` . You should see an output like this:
 
-```
+```bash
 go build -ldflags "-X github.com/tealbase/auth/cmd.Version=`git rev-parse HEAD`"
 GOOS=linux GOARCH=arm64 go build -ldflags "-X github.com/tealbase/auth/cmd.Version=`git rev-parse HEAD`" -o gotrue-arm64
 ```
 
-3. Execute the auth binary: `./gotrue`
+3. Execute the auth binary: `./auth`
 
 ### If you have docker installed
 
