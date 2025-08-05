@@ -4,9 +4,9 @@ import (
 	"net/http"
 
 	"github.com/tealbase/auth/internal/conf"
+	"github.com/tealbase/auth/internal/hooks/hookshttp"
+	"github.com/tealbase/auth/internal/hooks/hookspgfunc"
 	"github.com/tealbase/auth/internal/hooks/v0hooks"
-	"github.com/tealbase/auth/internal/hooks/v0hooks/v0http"
-	"github.com/tealbase/auth/internal/hooks/v0hooks/v0pgfunc"
 	"github.com/tealbase/auth/internal/storage"
 )
 
@@ -18,8 +18,8 @@ func NewManager(
 	db *storage.Connection,
 	config *conf.GlobalConfiguration,
 ) *Manager {
-	httpDr := v0http.New()
-	pgfuncDr := v0pgfunc.New(db)
+	httpDr := hookshttp.New()
+	pgfuncDr := hookspgfunc.New(db)
 	return &Manager{
 		v0mgr: v0hooks.NewManager(config, httpDr, pgfuncDr),
 	}

@@ -11,22 +11,22 @@ import (
 
 	"github.com/tealbase/auth/internal/api/apierrors"
 	"github.com/tealbase/auth/internal/conf"
-	"github.com/tealbase/auth/internal/hooks/v0hooks/v0http"
-	"github.com/tealbase/auth/internal/hooks/v0hooks/v0pgfunc"
+	"github.com/tealbase/auth/internal/hooks/hookshttp"
+	"github.com/tealbase/auth/internal/hooks/hookspgfunc"
 	"github.com/tealbase/auth/internal/observability"
 	"github.com/tealbase/auth/internal/storage"
 )
 
 type Manager struct {
 	config   *conf.GlobalConfiguration
-	v0http   *v0http.Dispatcher
-	v0pgfunc *v0pgfunc.Dispatcher
+	v0http   *hookshttp.Dispatcher
+	v0pgfunc *hookspgfunc.Dispatcher
 }
 
 func NewManager(
 	config *conf.GlobalConfiguration,
-	httpDr *v0http.Dispatcher,
-	pgfuncDr *v0pgfunc.Dispatcher,
+	httpDr *hookshttp.Dispatcher,
+	pgfuncDr *hookspgfunc.Dispatcher,
 ) *Manager {
 	return &Manager{
 		config:   config,
