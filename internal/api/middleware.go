@@ -15,6 +15,7 @@ import (
 	"github.com/tealbase/auth/internal/models"
 	"github.com/tealbase/auth/internal/observability"
 	"github.com/tealbase/auth/internal/security"
+	"github.com/tealbase/auth/internal/utilities"
 
 	"github.com/didip/tollbooth/v5"
 	"github.com/didip/tollbooth/v5/limiter"
@@ -116,7 +117,12 @@ func (a *API) verifyCaptcha(w http.ResponseWriter, req *http.Request) (context.C
 		return ctx, nil
 	}
 
-	verificationResult, err := security.VerifyRequest(req, strings.TrimSpace(config.Security.Captcha.Secret), config.Security.Captcha.Provider)
+	body := &security.GotrueRequest{}
+	if err := retrieveRequestParams(req, body); err != nil {
+		return nil, err
+	}
+
+	verificationResult, err := security.VerifyRequest(body, utilities.GetIPAddress(req), strings.TrimSpace(config.Security.Captcha.Secret), config.Security.Captcha.Provider)
 	if err != nil {
 		return nil, internalServerError("captcha verification process failed").WithInternalError(err)
 	}
@@ -141,26 +147,86 @@ func (a *API) isValidExternalHost(w http.ResponseWriter, req *http.Request) (con
 	ctx := req.Context()
 	config := a.config
 
-	var u *url.URL
-	var err error
-
-	baseUrl := config.API.ExternalURL
 	xForwardedHost := req.Header.Get("X-Forwarded-Host")
 	xForwardedProto := req.Header.Get("X-Forwarded-Proto")
-	if xForwardedHost != "" && xForwardedProto != "" {
-		baseUrl = fmt.Sprintf("%s://%s", xForwardedProto, xForwardedHost)
-	} else if req.URL.Scheme != "" && req.URL.Hostname() != "" {
-		baseUrl = fmt.Sprintf("%s://%s", req.URL.Scheme, req.URL.Hostname())
-	}
-	if u, err = url.ParseRequestURI(baseUrl); err != nil {
-		// fallback to the default hostname
-		log := observability.GetLogEntry(req).Entry
-		log.WithField("request_url", baseUrl).Warn(err)
-		if u, err = url.ParseRequestURI(config.API.ExternalURL); err != nil {
-			return ctx, err
+	reqHost := req.URL.Hostname()
+
+	if len(config.Mailer.ExternalHosts) > 0 {
+		// this server is configured to accept multiple external hosts, validate the host from the X-Forwarded-Host or Host headers
+
+		hostname := ""
+		protocol := "https"
+
+		if xForwardedHost != "" {
+			for _, host := range config.Mailer.ExternalHosts {
+				if host == xForwardedHost {
+					hostname = host
+					break
+				}
+			}
+		} else if reqHost != "" {
+			for _, host := range config.Mailer.ExternalHosts {
+				if host == reqHost {
+					hostname = host
+					break
+				}
+			}
+		}
+
+		if hostname != "" {
+			if hostname == "localhost" {
+				// allow the use of HTTP only if the accepted hostname was localhost
+				if xForwardedProto == "http" || req.URL.Scheme == "http" {
+					protocol = "http"
+				}
+			}
+
+			externalHostURL, err := url.ParseRequestURI(fmt.Sprintf("%s://%s", protocol, hostname))
+			if err != nil {
+				return ctx, err
+			}
+
+			return withExternalHost(ctx, externalHostURL), nil
 		}
 	}
-	return withExternalHost(ctx, u), nil
+
+	if xForwardedHost != "" || reqHost != "" {
+		// host has been provided to the request, but it hasn't been
+		// added to the allow list, raise a log message
+		// in tealbase platform the X-Forwarded-Host and full request
+		// URL are likely sanitzied before they reach the server
+
+		fields := make(logrus.Fields)
+
+		if xForwardedHost != "" {
+			fields["x_forwarded_host"] = xForwardedHost
+		}
+
+		if xForwardedProto != "" {
+			fields["x_forwarded_proto"] = xForwardedProto
+		}
+
+		if reqHost != "" {
+			fields["request_url_host"] = reqHost
+
+			if req.URL.Scheme != "" {
+				fields["request_url_scheme"] = req.URL.Scheme
+			}
+		}
+
+		logrus.WithFields(fields).Info("Request received external host in X-Forwarded-Host or Host headers, but the values have not been added to GOTRUE_MAILER_EXTERNAL_HOSTS and will not be used. To suppress this message add the host, or sanitize the headers before the request reaches Auth.")
+	}
+
+	// either the provided external hosts don't match the allow list, or
+	// the server is not configured to accept multiple hosts -- use the
+	// configured external URL instead
+
+	externalHostURL, err := url.ParseRequestURI(config.API.ExternalURL)
+	if err != nil {
+		return ctx, err
+	}
+
+	return withExternalHost(ctx, externalHostURL), nil
 }
 
 func (a *API) requireSAMLEnabled(w http.ResponseWriter, req *http.Request) (context.Context, error) {
