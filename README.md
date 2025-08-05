@@ -468,7 +468,7 @@ The base URL used for constructing the URLs to request authorization and access 
 To try out external authentication with Apple locally, you will need to do the following:
 
 1. Remap localhost to \<my_custom_dns \> in your `/etc/hosts` config.
-2. Configure auth to serve HTTPS traffic over localhost by replacing `ListenAndServe` in [api.go](api/api.go) with:
+2. Configure auth to serve HTTPS traffic over localhost by replacing `ListenAndServe` in [api.go](internal/api/api.go) with:
 
    ```
       func (a *API) ListenAndServe(hostAndPort string) {
@@ -820,7 +820,7 @@ Returns
 
 Register a new user with an email and password.
 
-```js
+```json
 {
   "email": "email@example.com",
   "password": "secret"
@@ -866,10 +866,36 @@ Returns:
 
 if AUTOCONFIRM is enabled and the sign up is a duplicate, then the endpoint will return:
 
-```
+```json
 {
   "code":400,
   "msg":"User already registered"
+}
+```
+
+### **POST /resend**
+
+Allows a user to resend an existing signup, sms, email_change or phone_change OTP.
+
+```json
+{
+  "email": "user@example.com",
+  "type": "signup"
+}
+```
+
+```json
+{
+  "phone": "12345678",
+  "type": "sms"
+}
+```
+
+returns:
+
+```json
+{
+  "message_id": "msgid123456"
 }
 ```
 
@@ -985,14 +1011,16 @@ One-Time-Password. Will deliver a magiclink or sms otp to the user depending on 
 
 If `"create_user": true`, user will not be automatically signed up if the user doesn't exist.
 
-```js
+```json
 {
   "phone": "12345678" // follows the E.164 format
   "create_user": true
 }
+```
 
 OR
 
+```json
 // exactly the same as /magiclink
 {
   "email": "email@example.com"
@@ -1002,7 +1030,7 @@ OR
 
 Returns:
 
-```
+```json
 {}
 ```
 
